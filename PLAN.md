@@ -89,46 +89,46 @@ Build `shlice`, a cross-platform Zig CLI that manages persistent local shell pro
 - treat GitHub Actions as the authoritative and only build/test environment for this repo because Zig is not installed locally
 - design each slice so it is small enough to validate comfortably through `python ci.py` rather than depending on a fast local Zig loop
 
-### Phase 0: Foundation And Scaffolding
+### Phase 0: Foundation And Scaffolding ✅
 - normalize the CLI surface to match the intended commands: `start`, `exec`, `stop`, `status`, `list`, and help aliases
 - split code into small modules such as `cli.zig`, `state_dir.zig`, `shell_id.zig`, `registry.zig`, `locks.zig`, `process.zig`, and `protocol.zig`
 - add shared error types and output helpers so user-visible behavior is stable before shell orchestration exists
 - keep the CI workflow green after every slice, specifically `zig build test-compile`, `zig build test` where runnable, and `zig build -Doptimize=ReleaseSmall`
 
-### Phase 1: Pure Data And Filesystem Layer
+### Phase 1: Pure Data And Filesystem Layer ✅
 - implement shell id validation for `[A-Za-z0-9_-]+` and auto-id generation
 - implement platform-specific state-dir discovery with Linux XDG fallback behavior
 - define on-disk layout for registry entries, per-shell metadata, and lock files
 - implement registry CRUD and shell enumeration without starting real child processes yet
 - expose `status` and `list` against file-backed fake entries first so the listing model is testable before process management
 
-### Phase 2: Locking, Liveness, And Recovery
+### Phase 2: Locking, Liveness, And Recovery ✅
 - add per-id start locks and per-shell exec locks with stale-lock detection using pid/process liveness checks
 - implement registry revalidation and pruning helpers used by `start`, `status`, and `list`
 - model public shell states as `stopped`, `busy`, and `ready`, even if startup and exec busy are still distinct internally
 - test lock acquisition, contention, stale recovery, and registry pruning entirely through deterministic filesystem fixtures
 
-### Phase 3: Process Launch And Ready Detection
+### Phase 3: Process Launch And Ready Detection ✅
 - implement OS-specific child process launch behind a common interface, initially using redirected stdin/stdout/stderr pipes
 - bootstrap supported shells with a small wrapper that emits a ready OSC marker after startup
 - make `start` wait until the shell is truly ready, then persist metadata and registry state atomically
 - make `start --id` fail only when the target id resolves to a live shell after revalidation
 - make `stop` gracefully terminate, then force-kill after a short timeout, and always clean metadata on success
 
-### Phase 4: Single-Request Exec Protocol
+### Phase 4: Single-Request Exec Protocol ✅
 - implement framed `exec` submission with a unique request id, begin marker, end marker, and explicit exit code marker
 - stream stdout and stderr while stripping framing from user-visible stdout
 - keep background drain loops active when no client is attached so the shell never blocks on full pipes
 - implement end-to-end timeout handling that includes waiting for a busy shell, request submission, and framed completion
 - ensure timeout or client exit releases exec lock state without killing the shell by default
 
-### Phase 5: Concurrency And Multi-Shell Behavior
+### Phase 5: Concurrency And Multi-Shell Behavior ✅
 - verify that different shell ids can start and execute concurrently without shared global bottlenecks
 - verify that a second `exec` against the same shell waits for exclusive access rather than failing fast
 - ensure `status` reflects `busy` during startup and active execution, and returns to `ready` afterward
 - harden cleanup paths for orphaned metadata, dead shells, interrupted clients, and partially written state files
 
-### Phase 6: UX Polish And Release Shape
+### Phase 6: UX Polish And Release Shape ✅
 - tighten help text, error messages, and exit codes to make scripted use predictable
 - add `list` and `status` formatting that is stable and easy to parse visually
 - verify `ReleaseSmall` builds for all configured targets and keep packaging assumptions aligned with `dist/` artifacts from CI

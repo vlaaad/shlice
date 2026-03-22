@@ -1,62 +1,25 @@
 const std = @import("std");
-
-const usage_text =
-    \\shlice
-    \\
-    \\  shlice start [shell]
-    \\  shlice start -- <custom-command...>
-    \\  shlice eval [--timeout <seconds>] [<code>]
-    \\  echo "<code>" | shlice eval
-    \\  shlice stop
-    \\  shlice status
-;
+const app = @import("app.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-
-    _ = args.next();
-    const command = args.next() orelse {
-        try writeUsage();
-        return;
+    const exit_code = app.run(gpa.allocator()) catch |err| {
+        _ = gpa.deinit();
+        return err;
     };
-
-    if (std.mem.eql(u8, command, "-h") or
-        std.mem.eql(u8, command, "--help") or
-        std.mem.eql(u8, command, "help"))
-    {
-        try writeUsage();
-        return;
-    }
-
-    const stdout = std.io.getStdOut().writer();
-    if (std.mem.eql(u8, command, "start") or
-        std.mem.eql(u8, command, "eval") or
-        std.mem.eql(u8, command, "stop") or
-        std.mem.eql(u8, command, "status"))
-    {
-        try stdout.print("TODO: {s}\n", .{command});
-        return;
-    }
-
-    const stderr = std.io.getStdErr().writer();
-    try stderr.print("unknown command: {s}\n\n", .{command});
-    try writeUsageTo(stderr);
-    std.process.exit(1);
+    _ = gpa.deinit();
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
-fn writeUsage() !void {
-    try writeUsageTo(std.io.getStdOut().writer());
-}
-
-fn writeUsageTo(writer: anytype) !void {
-    try writer.writeAll(usage_text ++ "\n");
-}
-
-test "help text mentions eval" {
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "shlice eval") != null);
+test {
+    std.testing.refAllDecls(@import("app.zig"));
+    std.testing.refAllDecls(@import("broker.zig"));
+    std.testing.refAllDecls(@import("cli.zig"));
+    std.testing.refAllDecls(@import("locks.zig"));
+    std.testing.refAllDecls(@import("output.zig"));
+    std.testing.refAllDecls(@import("process.zig"));
+    std.testing.refAllDecls(@import("protocol.zig"));
+    std.testing.refAllDecls(@import("registry.zig"));
+    std.testing.refAllDecls(@import("shell_id.zig"));
+    std.testing.refAllDecls(@import("state_dir.zig"));
 }

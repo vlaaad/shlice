@@ -169,8 +169,14 @@ def main() -> int:
         ).stdout.strip()
         print(f"result: {conclusion}", flush=True)
         if watch.returncode == 0:
-            shutil.rmtree(DIST, ignore_errors=True)
-            DIST.mkdir(exist_ok=True)
+            try:
+                if DIST.exists():
+                    shutil.rmtree(DIST, ignore_errors=False)
+                DIST.mkdir(exist_ok=True)
+            except PermissionError as exc:
+                raise RuntimeError(
+                    f"could not clear {DIST}; a file is likely still in use. stop any running shlice processes launched from dist/ and retry"
+                ) from exc
             print(f"downloading artifacts to {DIST}...", flush=True)
             run("gh", "run", "download", str(run_id), "--dir", str(DIST))
         return watch.returncode
