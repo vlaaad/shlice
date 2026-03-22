@@ -5,13 +5,14 @@ pub fn printUsage(writer: anytype) !void {
         \\shlice
         \\
         \\  shlice start [--id <shell-id>] -- <custom-command...>
-        \\  shlice exec --id <shell-id> [--timeout <seconds>] <command>
-        \\  echo "<command>" | shlice exec --id <shell-id>
-        \\  shlice stop --id <shell-id>
+        \\  shlice exec [--id <shell-id>] [--timeout <seconds>] <command>
+        \\  echo "<command>" | shlice exec [--id <shell-id>]
+        \\  shlice stop [<shell-id>]
         \\  shlice status [--id <shell-id>]
         \\  shlice list
         \\
         \\Help flags: -h, --help, -?
+        \\Default shell id: main
         \\
     );
 }

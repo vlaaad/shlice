@@ -28,6 +28,7 @@ const SharedState = struct {
     active_exit_code: ?i32 = null,
     saw_begin: bool = false,
     saw_end: bool = false,
+    saw_prompt_after_end: bool = false,
     completion_observed_at_ms: ?i64 = null,
     shutdown: bool = false,
 };
@@ -314,7 +315,7 @@ fn maybeFinalizeRequest(allocator: std.mem.Allocator, shared: *SharedState) !voi
     shared.mutex.lock();
     shutting_down = shared.shutdown;
     if (shared.active_request_id) |active_id| {
-        const completion_ready = shared.saw_end and shared.completion_observed_at_ms != null and std.time.milliTimestamp() - shared.completion_observed_at_ms.? >= completion_grace_ms;
+        const completion_ready = shared.saw_end and shared.saw_prompt_after_end and shared.completion_observed_at_ms != null and std.time.milliTimestamp() - shared.completion_observed_at_ms.? >= completion_grace_ms;
         if (completion_ready or shutting_down) {
             should_finish = true;
             request_id = active_id;
@@ -327,6 +328,7 @@ fn maybeFinalizeRequest(allocator: std.mem.Allocator, shared: *SharedState) !voi
             shared.active_exit_code = null;
             shared.saw_begin = false;
             shared.saw_end = false;
+            shared.saw_prompt_after_end = false;
             shared.completion_observed_at_ms = null;
         }
     }
@@ -386,19 +388,30 @@ fn pumpStdout(shared: *SharedState, file: std.fs.File) void {
                 shared.mutex.unlock();
                 return;
             };
-            if (parsed.began_request) {
-                shared.saw_begin = true;
-                shared.saw_end = false;
-                shared.completion_observed_at_ms = null;
-            }
-            if (parsed.ended_request) {
-                shared.saw_end = true;
-                shared.completion_observed_at_ms = std.time.milliTimestamp();
-            }
-            if (parsed.exit_code) |exit_code| shared.active_exit_code = exit_code;
+            applyParsedStdout(shared, parsed);
         }
         shared.mutex.unlock();
         trimFront(&pending, parse_len);
+    }
+}
+
+fn applyParsedStdout(shared: *SharedState, parsed: protocol.StdoutParse) void {
+    if (parsed.began_request) {
+        shared.saw_begin = true;
+        shared.saw_end = false;
+        shared.saw_prompt_after_end = false;
+        shared.completion_observed_at_ms = null;
+        shared.active_exit_code = null;
+    }
+
+    if (parsed.ended_request and shared.saw_begin) {
+        shared.saw_end = true;
+        shared.active_exit_code = parsed.exit_code;
+    }
+
+    if (parsed.finished_prompt and shared.saw_begin and shared.saw_end) {
+        shared.saw_prompt_after_end = true;
+        shared.completion_observed_at_ms = std.time.milliTimestamp();
     }
 }
 
@@ -466,4 +479,56 @@ fn flushPendingStdout(shared: *SharedState, bytes: []const u8, parse_state: *pro
 
 test "ready marker is prompt marker" {
     try std.testing.expect(protocol.chunkContainsReady(protocol.ready_marker));
+}
+
+test "ignore end marker until request begins" {
+    var shared = SharedState{
+        .allocator = std.testing.allocator,
+        .root = "root",
+        .id = "demo",
+        .command_line = "cmd",
+        .cwd = ".",
+        .shell_pid = 1,
+    };
+
+    applyParsedStdout(&shared, .{
+        .wrote_data = false,
+        .began_request = false,
+        .ended_request = true,
+        .finished_prompt = false,
+        .exit_code = 0,
+    });
+    try std.testing.expect(!shared.saw_begin);
+    try std.testing.expect(!shared.saw_end);
+    try std.testing.expect(!shared.saw_prompt_after_end);
+    try std.testing.expectEqual(@as(?i32, null), shared.active_exit_code);
+
+    applyParsedStdout(&shared, .{
+        .wrote_data = false,
+        .began_request = true,
+        .ended_request = false,
+        .finished_prompt = false,
+        .exit_code = null,
+    });
+    applyParsedStdout(&shared, .{
+        .wrote_data = false,
+        .began_request = false,
+        .ended_request = true,
+        .finished_prompt = false,
+        .exit_code = 7,
+    });
+    try std.testing.expect(!shared.saw_prompt_after_end);
+
+    applyParsedStdout(&shared, .{
+        .wrote_data = false,
+        .began_request = false,
+        .ended_request = false,
+        .finished_prompt = true,
+        .exit_code = null,
+    });
+    try std.testing.expect(shared.saw_begin);
+    try std.testing.expect(shared.saw_end);
+    try std.testing.expect(shared.saw_prompt_after_end);
+    try std.testing.expect(shared.completion_observed_at_ms != null);
+    try std.testing.expectEqual(@as(?i32, 7), shared.active_exit_code);
 }

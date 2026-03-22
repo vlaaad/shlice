@@ -57,6 +57,7 @@ pub const StdoutParse = struct {
     wrote_data: bool,
     began_request: bool,
     ended_request: bool,
+    finished_prompt: bool,
     exit_code: ?i32,
 };
 
@@ -69,6 +70,7 @@ pub fn parseStdoutChunk(writer: anytype, chunk: []const u8, state: *StdoutParseS
         .wrote_data = false,
         .began_request = false,
         .ended_request = false,
+        .finished_prompt = false,
         .exit_code = null,
     };
 
@@ -100,6 +102,7 @@ pub fn parseStdoutChunk(writer: anytype, chunk: []const u8, state: *StdoutParseS
             state.inside_prompt = true;
         } else if (std.mem.eql(u8, marker, prompt_end_marker)) {
             state.inside_prompt = false;
+            result.finished_prompt = true;
         } else if (std.mem.eql(u8, marker, command_begin_marker)) {
             state.inside_prompt = false;
             result.began_request = true;
@@ -136,6 +139,7 @@ test "parse stdout strips generic markers" {
     const parsed = try parseStdoutChunk(out.writer(), chunk, &state);
     try std.testing.expect(parsed.began_request);
     try std.testing.expect(parsed.ended_request);
+    try std.testing.expect(!parsed.finished_prompt);
     try std.testing.expectEqual(@as(?i32, 3), parsed.exit_code);
     try std.testing.expectEqualStrings("hello", out.items);
 }
@@ -148,6 +152,7 @@ test "parse stdout strips prompt text" {
     const parsed = try parseStdoutChunk(out.writer(), chunk, &state);
     try std.testing.expect(parsed.began_request);
     try std.testing.expect(parsed.ended_request);
+    try std.testing.expect(parsed.finished_prompt);
     try std.testing.expectEqualStrings("1\n", out.items);
 }
 

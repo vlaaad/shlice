@@ -26,9 +26,6 @@ pub fn run(allocator: std.mem.Allocator) !u8 {
             error.InvalidArguments => {
                 try output.printError("invalid arguments");
             },
-            error.MissingShellId => {
-                try output.printError("missing required --id");
-            },
             error.MissingValue => {
                 try output.printError("missing flag value");
             },
@@ -98,7 +95,7 @@ fn runStart(allocator: std.mem.Allocator, options: cli.StartOptions) !u8 {
     const root = try state_dir.ensureLayout(allocator);
     defer allocator.free(root);
 
-    const id = if (options.id) |provided| try allocator.dupe(u8, provided) else try allocateFreshId(allocator, root);
+    const id = if (options.id) |provided| try allocator.dupe(u8, provided) else try allocator.dupe(u8, "main");
     defer allocator.free(id);
 
     const shell_dir = try state_dir.ensureShellDir(allocator, root, id);
@@ -285,19 +282,6 @@ fn runExec(allocator: std.mem.Allocator, options: cli.ExecOptions) !u8 {
         std.time.sleep(25 * std.time.ns_per_ms);
     }
     return 0;
-}
-
-fn allocateFreshId(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    while (true) {
-        const id = try shell_id.generate(allocator);
-        errdefer allocator.free(id);
-        if (try registry.readOne(allocator, root, id)) |record| {
-            registry.freeRecord(allocator, record);
-            allocator.free(id);
-            continue;
-        }
-        return id;
-    }
 }
 
 fn spawnBroker(allocator: std.mem.Allocator, root: []const u8, id: []const u8, cwd: []const u8, command: []const []const u8) !void {

@@ -96,7 +96,7 @@ fn parseStart(args: []const []const u8) !StartOptions {
 }
 
 fn parseExec(args: []const []const u8) !ExecOptions {
-    var id: ?[]const u8 = null;
+    var id: []const u8 = "main";
     var timeout_seconds: u32 = 5;
     var command: ?[]const u8 = null;
 
@@ -108,7 +108,7 @@ fn parseExec(args: []const []const u8) !ExecOptions {
             index += 1;
             if (index >= args.len) return error.MissingValue;
             id = args[index];
-            try shell_id.validate(id.?);
+            try shell_id.validate(id);
             continue;
         }
         if (std.mem.eql(u8, arg, "--timeout")) {
@@ -124,27 +124,17 @@ fn parseExec(args: []const []const u8) !ExecOptions {
         return error.InvalidArguments;
     }
 
-    if (id == null) return error.MissingShellId;
-    return .{ .id = id.?, .timeout_seconds = timeout_seconds, .command = command };
+    return .{ .id = id, .timeout_seconds = timeout_seconds, .command = command };
 }
 
 fn parseStop(args: []const []const u8) !StopOptions {
-    var id: ?[]const u8 = null;
-    var index: usize = 0;
-    while (index < args.len) : (index += 1) {
-        const arg = args[index];
-        if (isHelp(arg)) return error.ShowHelp;
-        if (std.mem.eql(u8, arg, "--id")) {
-            index += 1;
-            if (index >= args.len) return error.MissingValue;
-            id = args[index];
-            try shell_id.validate(id.?);
-            continue;
-        }
-        return error.InvalidArguments;
+    if (args.len == 0) return .{ .id = "main" };
+    if (args.len == 1) {
+        if (isHelp(args[0])) return error.ShowHelp;
+        try shell_id.validate(args[0]);
+        return .{ .id = args[0] };
     }
-    if (id == null) return error.MissingShellId;
-    return .{ .id = id.? };
+    return error.InvalidArguments;
 }
 
 fn parseBroker(args: []const []const u8) !BrokerOptions {
@@ -199,8 +189,10 @@ test "parse list" {
     try std.testing.expect(parsed == .list);
 }
 
-test "exec requires id" {
-    try std.testing.expectError(error.MissingShellId, parse(std.testing.allocator, &.{ "shlice", "exec", "echo hi" }));
+test "exec defaults id to main" {
+    const parsed = try parse(std.testing.allocator, &.{ "shlice", "exec", "echo hi" });
+    try std.testing.expect(parsed == .exec);
+    try std.testing.expectEqualStrings("main", parsed.exec.id);
 }
 
 test "start parses separator command" {
@@ -208,4 +200,16 @@ test "start parses separator command" {
     try std.testing.expect(parsed == .start);
     try std.testing.expectEqualStrings("demo", parsed.start.id.?);
     try std.testing.expectEqual(@as(usize, 3), parsed.start.command.len);
+}
+
+test "stop defaults id to main" {
+    const parsed = try parse(std.testing.allocator, &.{ "shlice", "stop" });
+    try std.testing.expect(parsed == .stop);
+    try std.testing.expectEqualStrings("main", parsed.stop.id);
+}
+
+test "stop accepts positional id" {
+    const parsed = try parse(std.testing.allocator, &.{ "shlice", "stop", "demo" });
+    try std.testing.expect(parsed == .stop);
+    try std.testing.expectEqualStrings("demo", parsed.stop.id);
 }
