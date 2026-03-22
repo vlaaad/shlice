@@ -13,6 +13,7 @@ const completion_file_name = "completion.json";
 const stdout_file_name = "stdout.log";
 const stderr_file_name = "stderr.log";
 const completion_grace_ms: i64 = 100;
+const ready_timeout_ms: i64 = 30000;
 
 const SharedState = struct {
     allocator: std.mem.Allocator,
@@ -202,7 +203,7 @@ fn waitForReady(allocator: std.mem.Allocator, stdout_file: *std.fs.File) !bool {
     var thread = try std.Thread.spawn(.{}, waitForReadyReader, .{ &state, stdout_file });
     defer thread.join();
 
-    const deadline = std.time.milliTimestamp() + 5000;
+    const deadline = std.time.milliTimestamp() + ready_timeout_ms;
     while (std.time.milliTimestamp() < deadline) {
         state.mutex.lock();
         const done = state.done;

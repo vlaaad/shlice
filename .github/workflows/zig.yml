@@ -33,6 +33,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
+      - name: Install Java
+        if: matrix.run_tests
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Clojure
+        if: matrix.run_tests
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
       - name: Install Zig (Unix)
         if: runner.os != 'Windows'
         shell: bash

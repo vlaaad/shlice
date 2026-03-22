@@ -10,6 +10,8 @@ const registry = @import("registry.zig");
 const shell_id = @import("shell_id.zig");
 const state_dir = @import("state_dir.zig");
 
+const shell_ready_timeout_ms: i64 = 30000;
+
 pub fn run(allocator: std.mem.Allocator) !u8 {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
@@ -325,7 +327,7 @@ fn spawnBroker(allocator: std.mem.Allocator, root: []const u8, id: []const u8, c
 }
 
 fn waitForShellReady(allocator: std.mem.Allocator, root: []const u8, id: []const u8) !bool {
-    const deadline = std.time.milliTimestamp() + 5000;
+    const deadline = std.time.milliTimestamp() + shell_ready_timeout_ms;
     while (std.time.milliTimestamp() < deadline) {
         if (try registry.readOne(allocator, root, id)) |record| {
             defer registry.freeRecord(allocator, record);

@@ -10,7 +10,8 @@
  :prompt #(do
             (print "\u001b]133;A\u0007")
             (printf "%s=> " (ns-name *ns*))
-            (print "\u001b]133;B\u0007"))
+            (print "\u001b]133;B\u0007")
+            (flush))
  :print #(do
            (prn %)
            (print "\u001b]133;D;0\u0007")

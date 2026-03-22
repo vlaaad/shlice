@@ -2,3 +2,6 @@
 /zig-out/
 /__pycache__/
 /dist/
+/.clj-kondo
+/.cpcache
+/.lsp
