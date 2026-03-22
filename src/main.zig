@@ -15,6 +15,7 @@ test {
     std.testing.refAllDecls(@import("app.zig"));
     std.testing.refAllDecls(@import("broker.zig"));
     std.testing.refAllDecls(@import("cli.zig"));
+    std.testing.refAllDecls(@import("fs_atomic.zig"));
     std.testing.refAllDecls(@import("locks.zig"));
     std.testing.refAllDecls(@import("output.zig"));
     std.testing.refAllDecls(@import("process.zig"));

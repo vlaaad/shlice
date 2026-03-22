@@ -1,6 +1,7 @@
 const std = @import("std");
 const broker = @import("broker.zig");
 const cli = @import("cli.zig");
+const fs_atomic = @import("fs_atomic.zig");
 const locks = @import("locks.zig");
 const output = @import("output.zig");
 const process = @import("process.zig");
@@ -240,7 +241,7 @@ fn runExec(allocator: std.mem.Allocator, options: cli.ExecOptions) !u8 {
 
     const request_body = try protocol.stringifyRequest(allocator, .{ .id = request_id, .command = command });
     defer allocator.free(request_body);
-    try writeFileAtomicAbsolute(allocator, request_path, request_body);
+    try fs_atomic.writeFileAbsolute(allocator, request_path, request_body);
 
     var stdout_offset: u64 = 0;
     var stderr_offset: u64 = 0;
@@ -423,20 +424,4 @@ fn readFileAllocAbsolute(allocator: std.mem.Allocator, path: []const u8, max_byt
 fn absolutePathExists(path: []const u8) bool {
     std.fs.accessAbsolute(path, .{}) catch return false;
     return true;
-}
-
-fn writeFileAtomicAbsolute(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
-    defer allocator.free(temp_path);
-
-    const file = try std.fs.createFileAbsolute(temp_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(bytes);
-    try file.sync();
-
-    std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    try std.fs.renameAbsolute(temp_path, path);
 }

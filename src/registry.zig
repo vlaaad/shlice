@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs_atomic = @import("fs_atomic.zig");
 const process = @import("process.zig");
 const shell_id = @import("shell_id.zig");
 const state_dir = @import("state_dir.zig");
@@ -38,9 +39,7 @@ pub fn upsert(allocator: std.mem.Allocator, root: []const u8, record: ShellRecor
     const payload = try std.json.stringifyAlloc(allocator, record, .{ .whitespace = .indent_2 });
     defer allocator.free(payload);
 
-    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(payload);
+    try fs_atomic.writeFileAbsolute(allocator, path, payload);
 }
 
 pub fn remove(allocator: std.mem.Allocator, root: []const u8, id: []const u8) !void {

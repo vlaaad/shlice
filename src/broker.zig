@@ -1,5 +1,6 @@
 const std = @import("std");
 const cli = @import("cli.zig");
+const fs_atomic = @import("fs_atomic.zig");
 const process = @import("process.zig");
 const protocol = @import("protocol.zig");
 const registry = @import("registry.zig");
@@ -347,7 +348,7 @@ fn maybeFinalizeRequest(allocator: std.mem.Allocator, shared: *SharedState) !voi
         .timed_out = shutting_down and exit_code == 124,
     });
     defer allocator.free(completion);
-    try writeFileAtomicAbsolute(allocator, completion_path, completion);
+    try fs_atomic.writeFileAbsolute(allocator, completion_path, completion);
     std.fs.deleteFileAbsolute(request_path) catch |err| switch (err) { error.FileNotFound => {}, else => return err };
     allocator.free(request_id.?);
     try registry.upsert(allocator, shared.root, .{
@@ -422,7 +423,7 @@ fn pumpStderr(shared: *SharedState, file: std.fs.File) void {
 fn writeErrorFile(allocator: std.mem.Allocator, root: []const u8, id: []const u8, message: []const u8) !void {
     const path = try state_dir.shellFilePath(allocator, root, id, error_file_name);
     defer allocator.free(path);
-    try writeFileAtomicAbsolute(allocator, path, message);
+    try fs_atomic.writeFileAbsolute(allocator, path, message);
 }
 
 fn cleanup(allocator: std.mem.Allocator, root: []const u8, id: []const u8) !void {
@@ -439,22 +440,6 @@ fn readFileAllocAbsolute(allocator: std.mem.Allocator, path: []const u8, max_byt
     const file = try std.fs.openFileAbsolute(path, .{});
     defer file.close();
     return file.readToEndAlloc(allocator, max_bytes);
-}
-
-fn writeFileAtomicAbsolute(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
-    defer allocator.free(temp_path);
-
-    const file = try std.fs.createFileAbsolute(temp_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(bytes);
-    try file.sync();
-
-    std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    try std.fs.renameAbsolute(temp_path, path);
 }
 
 fn completedPrefixLen(bytes: []const u8) usize {
