@@ -1,0 +1,12 @@
+.{
+    .name = .shlice,
+    .version = "0.1.0",
+    .fingerprint = 0x9d8e4a1b0f9c2231,
+    .minimum_zig_version = "0.13.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
