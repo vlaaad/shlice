@@ -6,17 +6,69 @@ on:
 
 jobs:
   build-and-test:
+    env:
+      ZIG_VERSION: 0.13.0
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux
+            run_tests: true
+          - os: ubuntu-latest
+            target: aarch64-linux
+            run_tests: false
+          - os: macos-latest
+            target: aarch64-macos
+            run_tests: true
+          - os: macos-latest
+            target: x86_64-macos
+            run_tests: false
+          - os: windows-latest
+            target: x86_64-windows
+            run_tests: true
+          - os: windows-latest
+            target: aarch64-windows
+            run_tests: false
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
+      - uses: actions/checkout@v6
+      - name: Install Zig (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64) archive="zig-linux-x86_64-${ZIG_VERSION}.tar.xz" ;;
+            macOS-ARM64) archive="zig-macos-aarch64-${ZIG_VERSION}.tar.xz" ;;
+            *)
+              echo "unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2
+              exit 1
+              ;;
+          esac
+          curl -L --fail --output "$archive" "https://ziglang.org/download/${ZIG_VERSION}/$archive"
+          tar -xf "$archive"
+          echo "$PWD/${archive%.tar.xz}" >> "$GITHUB_PATH"
+      - name: Install Zig (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = switch ("${{ runner.arch }}") {
+            'X64' { "zig-windows-x86_64-$env:ZIG_VERSION.zip" }
+            default { throw "unsupported runner: ${{ runner.os }}-${{ runner.arch }}" }
+          }
+          Invoke-WebRequest -Uri "https://ziglang.org/download/$env:ZIG_VERSION/$archive" -OutFile $archive
+          Expand-Archive -Path $archive -DestinationPath . -Force
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $PWD ($archive -replace '\.zip$', ''))
+      - name: Compile tests
+        run: zig build test-compile -Dtarget=${{ matrix.target }}
       - name: Run tests
-        run: zig build test
+        if: matrix.run_tests
+        run: zig build test -Dtarget=${{ matrix.target }}
       - name: Build release binary
-        run: zig build -Doptimize=ReleaseSmall
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSmall
+      - name: Upload release binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: shlice-${{ matrix.target }}
+          path: zig-out/bin/*

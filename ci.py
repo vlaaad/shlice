@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -10,13 +11,10 @@ import time
 
 
 ROOT = Path(__file__).resolve().parent
+DIST = ROOT / "dist"
 WORKFLOW_NAME = "Zig CI"
 POLL_SECONDS = 3
 POLL_TIMEOUT_SECONDS = 180
-
-
-class CommandError(RuntimeError):
-    pass
 
 
 def run(
@@ -37,145 +35,8 @@ def run(
             or result.stdout.strip()
             or f"exit {result.returncode}"
         )
-        raise CommandError(f"{command}: {message}")
+        raise RuntimeError(f"{command}: {message}")
     return result
-
-
-def print_step(message: str) -> None:
-    print(message, flush=True)
-
-
-def git_env(index_path: Path) -> dict[str, str]:
-    env = os.environ.copy()
-    env["GIT_INDEX_FILE"] = str(index_path)
-    return env
-
-
-def git_head() -> str:
-    return run("git", "rev-parse", "HEAD").stdout.strip()
-
-
-def is_dirty() -> bool:
-    return bool(
-        run("git", "status", "--porcelain=v1", "--untracked-files=all").stdout.strip()
-    )
-
-
-def require_prereqs() -> None:
-    run("git", "rev-parse", "--show-toplevel")
-    run("git", "remote", "get-url", "origin")
-    run("gh", "auth", "status")
-
-
-def repo_name_with_owner() -> str:
-    return run(
-        "gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"
-    ).stdout.strip()
-
-
-def remote_branch_exists(branch: str) -> bool:
-    result = run(
-        "git",
-        "ls-remote",
-        "--exit-code",
-        "--heads",
-        "origin",
-        f"refs/heads/{branch}",
-        check=False,
-    )
-    return result.returncode == 0
-
-
-def build_snapshot_commit(
-    head: str,
-) -> tuple[str, tempfile.TemporaryDirectory[str] | None]:
-    if not is_dirty():
-        return head, None
-
-    tempdir = tempfile.TemporaryDirectory(prefix="ci-py-")
-    index_path = Path(tempdir.name) / "index"
-    env = git_env(index_path)
-
-    run("git", "read-tree", "HEAD", env=env)
-    run("git", "add", "-A", "--", ".", env=env)
-    tree = run("git", "write-tree", env=env).stdout.strip()
-    head_tree = run("git", "rev-parse", "HEAD^{tree}").stdout.strip()
-
-    if tree == head_tree:
-        tempdir.cleanup()
-        return head, None
-
-    commit = run(
-        "git",
-        "commit-tree",
-        tree,
-        "-p",
-        head,
-        "-m",
-        f"ci snapshot for {head}",
-        env=env,
-    ).stdout.strip()
-    return commit, tempdir
-
-
-def push_snapshot(commit: str, branch: str) -> None:
-    run("git", "push", "origin", f"{commit}:refs/heads/{branch}")
-
-
-def delete_remote_branch(branch: str) -> None:
-    run("git", "push", "origin", "--delete", branch)
-
-
-def find_run_id(branch: str, commit: str, pushed_after: str) -> int:
-    deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        result = run(
-            "gh",
-            "run",
-            "list",
-            "--workflow",
-            WORKFLOW_NAME,
-            "--branch",
-            branch,
-            "--event",
-            "push",
-            "--json",
-            "databaseId,headSha,createdAt",
-            check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            runs = json.loads(result.stdout)
-            for item in runs:
-                if item.get("headSha") != commit:
-                    continue
-                if item.get("createdAt", "") < pushed_after:
-                    continue
-                database_id = item.get("databaseId")
-                if isinstance(database_id, int):
-                    return database_id
-        time.sleep(POLL_SECONDS)
-
-    raise CommandError(f"timed out waiting for {WORKFLOW_NAME} run on {branch}")
-
-
-def run_html_url(repo: str, run_id: int) -> str:
-    return run(
-        "gh",
-        "api",
-        f"repos/{repo}/actions/runs/{run_id}",
-        "--jq",
-        ".html_url",
-    ).stdout.strip()
-
-
-def run_conclusion(repo: str, run_id: int) -> str:
-    return run(
-        "gh",
-        "api",
-        f"repos/{repo}/actions/runs/{run_id}",
-        "--jq",
-        ".conclusion // .status",
-    ).stdout.strip()
 
 
 def main() -> int:
@@ -190,48 +51,141 @@ def main() -> int:
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:
-        require_prereqs()
-        repo = repo_name_with_owner()
-        head = git_head()
-        commit, tempdir = build_snapshot_commit(head)
+        run("git", "rev-parse", "--show-toplevel")
+        run("git", "remote", "get-url", "origin")
+        run("gh", "auth", "status")
+        repo = run(
+            "gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"
+        ).stdout.strip()
+        head = run("git", "rev-parse", "HEAD").stdout.strip()
+        commit = head
+        if run(
+            "git", "status", "--porcelain=v1", "--untracked-files=all"
+        ).stdout.strip():
+            tempdir = tempfile.TemporaryDirectory(prefix="ci-py-")
+            index_path = Path(tempdir.name) / "index"
+            env = os.environ.copy()
+            env["GIT_INDEX_FILE"] = str(index_path)
+
+            run("git", "read-tree", "HEAD", env=env)
+            run("git", "add", "-A", "--", ".", env=env)
+            tree = run("git", "write-tree", env=env).stdout.strip()
+            head_tree = run("git", "rev-parse", "HEAD^{tree}").stdout.strip()
+
+            if tree == head_tree:
+                tempdir.cleanup()
+                tempdir = None
+            else:
+                commit = run(
+                    "git",
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    head,
+                    "-m",
+                    f"ci snapshot for {head}",
+                    env=env,
+                ).stdout.strip()
+
         branch = f"ci/{commit}"
 
-        if remote_branch_exists(branch):
-            raise CommandError(f"remote branch already exists: {branch}")
+        if (
+            run(
+                "git",
+                "ls-remote",
+                "--exit-code",
+                "--heads",
+                "origin",
+                f"refs/heads/{branch}",
+                check=False,
+            ).returncode
+            == 0
+        ):
+            raise RuntimeError(f"remote branch already exists: {branch}")
 
-        print_step(f"snapshot: {commit}")
-        print_step(f"branch: {branch}")
+        print(f"snapshot: {commit}", flush=True)
+        print(f"branch: {branch}", flush=True)
 
         pushed_after = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        print_step("pushing snapshot...")
-        push_snapshot(commit, branch)
+        print("pushing snapshot...", flush=True)
+        run("git", "push", "origin", f"{commit}:refs/heads/{branch}")
         pushed = True
 
-        print_step("waiting for workflow run...")
-        run_id = find_run_id(branch, commit, pushed_after)
-        url = run_html_url(repo, run_id)
-        print_step(f"run: {url}")
+        print("waiting for workflow run...", flush=True)
+        run_id: int | None = None
+        deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
+        while time.monotonic() < deadline and run_id is None:
+            result = run(
+                "gh",
+                "run",
+                "list",
+                "--workflow",
+                WORKFLOW_NAME,
+                "--branch",
+                branch,
+                "--event",
+                "push",
+                "--json",
+                "databaseId,headSha,createdAt",
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for item in json.loads(result.stdout):
+                    if item.get("headSha") != commit:
+                        continue
+                    if item.get("createdAt", "") < pushed_after:
+                        continue
+                    database_id = item.get("databaseId")
+                    if isinstance(database_id, int):
+                        run_id = database_id
+                        break
+
+            if run_id is None:
+                time.sleep(POLL_SECONDS)
+
+        if run_id is None:
+            raise RuntimeError(f"timed out waiting for {WORKFLOW_NAME} run on {branch}")
+
+        url = run(
+            "gh",
+            "api",
+            f"repos/{repo}/actions/runs/{run_id}",
+            "--jq",
+            ".html_url",
+        ).stdout.strip()
+        print(f"run: {url}", flush=True)
 
         watch = subprocess.run(
             ["gh", "run", "watch", str(run_id), "--exit-status"],
             cwd=ROOT,
             check=False,
         )
-        conclusion = run_conclusion(repo, run_id)
-        print_step(f"result: {conclusion}")
+        conclusion = run(
+            "gh",
+            "api",
+            f"repos/{repo}/actions/runs/{run_id}",
+            "--jq",
+            ".conclusion // .status",
+        ).stdout.strip()
+        print(f"result: {conclusion}", flush=True)
+        if watch.returncode == 0:
+            shutil.rmtree(DIST, ignore_errors=True)
+            DIST.mkdir(exist_ok=True)
+            print(f"downloading artifacts to {DIST}...", flush=True)
+            run("gh", "run", "download", str(run_id), "--dir", str(DIST))
         return watch.returncode
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
-    except CommandError as exc:
+    except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
     finally:
         if pushed and branch:
             try:
-                print_step(f"deleting remote branch {branch}...")
-                delete_remote_branch(branch)
-            except CommandError as exc:
+                print(f"deleting remote branch {branch}...", flush=True)
+                run("git", "push", "origin", "--delete", branch)
+            except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 print(f"cleanup: git push origin --delete {branch}", file=sys.stderr)
         if tempdir is not None:

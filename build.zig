@@ -27,6 +27,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const compile_unit_tests = b.step("test-compile", "Compile unit tests");
+    compile_unit_tests.dependOn(&unit_tests.step);
+
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);

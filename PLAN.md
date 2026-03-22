@@ -4,7 +4,7 @@
 Build `shlice`, a cross-platform Zig CLI that manages one local shell session per exact working directory and slices command execution through that session without using TCP.
 
 ## UX
-- `shlice start <custom-command...>`
+- `shlice start -- <custom-command...>`
 - `shlice eval "<code>"`
 - `echo "<code>" | shlice eval`
 - `shlice stop`
