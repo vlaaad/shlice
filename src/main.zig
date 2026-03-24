@@ -21,6 +21,7 @@ test {
     std.testing.refAllDecls(@import("process.zig"));
     std.testing.refAllDecls(@import("protocol.zig"));
     std.testing.refAllDecls(@import("registry.zig"));
+    std.testing.refAllDecls(@import("ipc.zig"));
     std.testing.refAllDecls(@import("shell_id.zig"));
     std.testing.refAllDecls(@import("state_dir.zig"));
 }

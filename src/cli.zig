@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const shell_id = @import("shell_id.zig");
 
 pub const Parsed = union(enum) {
@@ -34,6 +35,7 @@ pub const BrokerOptions = struct {
     root: []const u8,
     id: []const u8,
     cwd: []const u8,
+    ready_socket: []const u8,
     command: []const []const u8,
 };
 
@@ -143,6 +145,7 @@ fn parseBroker(args: []const []const u8) !BrokerOptions {
     var root: ?[]const u8 = null;
     var id: ?[]const u8 = null;
     var cwd: ?[]const u8 = null;
+    var ready_socket: ?[]const u8 = null;
     var separator_index: ?usize = null;
 
     var index: usize = 0;
@@ -171,12 +174,22 @@ fn parseBroker(args: []const []const u8) !BrokerOptions {
             cwd = args[index];
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ready-socket")) {
+            index += 1;
+            if (index >= args.len) return error.MissingValue;
+            ready_socket = args[index];
+            continue;
+        }
         return error.InvalidArguments;
     }
 
     if (root == null or id == null or cwd == null) return error.InvalidArguments;
+    if (ready_socket == null) {
+        if (builtin.os.tag != .windows) return error.InvalidArguments;
+        ready_socket = "";
+    }
     const command = if (separator_index) |start| args[(start + 1)..] else args[args.len..args.len];
-    return .{ .root = root.?, .id = id.?, .cwd = cwd.?, .command = command };
+    return .{ .root = root.?, .id = id.?, .cwd = cwd.?, .ready_socket = ready_socket.?, .command = command };
 }
 
 fn isHelp(arg: []const u8) bool {

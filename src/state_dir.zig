@@ -4,6 +4,16 @@ pub fn appDataDir(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.getAppDataDir(allocator, "shlice");
 }
 
+pub fn ipcSocketPath(allocator: std.mem.Allocator, root: []const u8, shell_id: []const u8, name: []const u8) ![]u8 {
+    var hash: u64 = 0xcbf29ce484222325;
+    hash = fnv1a(hash, root);
+    hash = fnv1a(hash, "/");
+    hash = fnv1a(hash, shell_id);
+    hash = fnv1a(hash, "/");
+    hash = fnv1a(hash, name);
+    return std.fmt.allocPrint(allocator, "/tmp/shlice-{x}.sock", .{hash});
+}
+
 pub fn ensureLayout(allocator: std.mem.Allocator) ![]u8 {
     const root = try appDataDir(allocator);
     errdefer allocator.free(root);
@@ -71,6 +81,15 @@ fn deleteTreeAbsolute(path: []const u8) !void {
     var parent = try std.fs.openDirAbsolute(parent_path, .{});
     defer parent.close();
     try parent.deleteTree(base_name);
+}
+
+fn fnv1a(hash: u64, bytes: []const u8) u64 {
+    var value = hash;
+    for (bytes) |byte| {
+        value ^= byte;
+        value *%= 0x100000001b3;
+    }
+    return value;
 }
 
 test "layout paths contain registry" {

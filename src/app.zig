@@ -1,7 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const broker = @import("broker.zig");
 const cli = @import("cli.zig");
 const fs_atomic = @import("fs_atomic.zig");
+const ipc = @import("ipc.zig");
 const locks = @import("locks.zig");
 const output = @import("output.zig");
 const process = @import("process.zig");
@@ -94,6 +96,8 @@ fn runStatus(allocator: std.mem.Allocator, id: ?[]const u8) !u8 {
 }
 
 fn runStart(allocator: std.mem.Allocator, options: cli.StartOptions) !u8 {
+    if (builtin.os.tag == .windows) return runStartWindows(allocator, options);
+
     const root = try state_dir.ensureLayout(allocator);
     defer allocator.free(root);
 
@@ -120,7 +124,221 @@ fn runStart(allocator: std.mem.Allocator, options: cli.StartOptions) !u8 {
     const cwd = try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd);
 
-    try spawnBroker(allocator, root, id, cwd, options.command);
+    const ready_socket = try state_dir.ipcSocketPath(allocator, root, id, "startup");
+    defer allocator.free(ready_socket);
+
+    var ready_server = try ipc.bindUnixServer(ready_socket);
+    defer ready_server.deinit();
+
+    const broker_pid = try spawnBroker(allocator, root, id, cwd, ready_socket, options.command);
+    const ready_result = try waitForListenerFrame(allocator, &ready_server, shell_ready_timeout_ms);
+    switch (ready_result) {
+        .ready => {
+            try output.printStarted(id);
+            return 0;
+        },
+        .err => |message| {
+            defer allocator.free(message);
+            try output.printError(message);
+            cleanupShellState(allocator, root, id) catch {};
+            return 1;
+        },
+        .timeout, .closed => {
+            _ = process.forceKill(broker_pid);
+            try output.printError("shell did not become ready before timeout");
+            cleanupShellState(allocator, root, id) catch {};
+            return 1;
+        },
+    }
+}
+
+fn runStop(allocator: std.mem.Allocator, id: []const u8) !u8 {
+    if (builtin.os.tag == .windows) return runStopWindows(allocator, id);
+
+    const root = try state_dir.ensureLayout(allocator);
+    defer allocator.free(root);
+
+    const maybe_record = try registry.readOne(allocator, root, id);
+    if (maybe_record == null) {
+        try output.printError("shell not found");
+        return 1;
+    }
+    const record = maybe_record.?;
+    defer registry.freeRecord(allocator, record);
+
+    const control_path = try state_dir.ipcSocketPath(allocator, root, id, "control");
+    defer allocator.free(control_path);
+
+    var stream = ipc.connectUnixStream(control_path) catch {
+        try output.printError("shell not found");
+        return 1;
+    };
+    defer stream.close();
+
+    try ipc.sendFrame(&stream, .stop, &.{});
+
+    const result = try waitForStreamFrame(allocator, &stream, 5000);
+    switch (result) {
+        .stopped, .closed => {
+            try output.printStopped(id);
+            return 0;
+        },
+        .err => |message| {
+            defer allocator.free(message);
+            try output.printError(message);
+            return 1;
+        },
+        .timeout => {
+            try output.printError("stop timed out");
+            return 124;
+        },
+        else => return error.InvalidData,
+    }
+}
+
+fn runExec(allocator: std.mem.Allocator, options: cli.ExecOptions) !u8 {
+    if (builtin.os.tag == .windows) return runExecWindows(allocator, options);
+
+    const root = try state_dir.ensureLayout(allocator);
+    defer allocator.free(root);
+
+    const maybe_record = try registry.readOne(allocator, root, options.id);
+    if (maybe_record == null) {
+        try output.printError("shell not found");
+        return 1;
+    }
+    const record = maybe_record.?;
+    defer registry.freeRecord(allocator, record);
+
+    const command = if (options.command) |value| try allocator.dupe(u8, value) else try readCommandFromStdin(allocator);
+    defer allocator.free(command);
+    if (command.len == 0) {
+        try output.printError("missing command");
+        return 1;
+    }
+
+    const control_path = try state_dir.ipcSocketPath(allocator, root, options.id, "control");
+    defer allocator.free(control_path);
+
+    var stream = ipc.connectUnixStream(control_path) catch {
+        try output.printError("shell not found");
+        return 1;
+    };
+    defer stream.close();
+
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(options.timeout_seconds)) * 1000;
+    try ipc.sendFrame(&stream, .exec, command);
+
+    while (true) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline) {
+            try output.printError("exec timed out");
+            return 124;
+        }
+        const frame = try waitForStreamFrame(allocator, &stream, deadline - now);
+        switch (frame) {
+            .stdout => |bytes| {
+                defer allocator.free(bytes);
+                try std.io.getStdOut().writer().writeAll(bytes);
+            },
+            .stderr => |bytes| {
+                defer allocator.free(bytes);
+                try std.io.getStdErr().writer().writeAll(bytes);
+            },
+            .complete => |completion| {
+                if (completion.timed_out) {
+                    try output.printError("exec timed out");
+                    return 124;
+                }
+                return @intCast(@min(@max(completion.exit_code, 0), 255));
+            },
+            .err => |message| {
+                defer allocator.free(message);
+                try output.printError(message);
+                return 1;
+            },
+            .stopped, .closed => {
+                try output.printError("shell stopped");
+                return 1;
+            },
+            .timeout => {
+                try output.printError("exec timed out");
+                return 124;
+            },
+        }
+    }
+}
+
+fn spawnBroker(allocator: std.mem.Allocator, root: []const u8, id: []const u8, cwd: []const u8, ready_socket: []const u8, command: []const []const u8) !u32 {
+    const self_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(self_path);
+
+    const args_len: usize = 10;
+    const args = try allocator.alloc([]const u8, args_len);
+    defer allocator.free(args);
+
+    args[0] = self_path;
+    args[1] = "__broker";
+    args[2] = "--root";
+    args[3] = root;
+    args[4] = "--id";
+    args[5] = id;
+    args[6] = "--cwd";
+    args[7] = cwd;
+    args[8] = "--ready-socket";
+    args[9] = ready_socket;
+    if (command.len != 0) {
+        const separator_index = 10;
+        const extended = try allocator.alloc([]const u8, args_len + 1 + command.len);
+        defer allocator.free(extended);
+        @memcpy(extended[0..10], args[0..10]);
+        extended[separator_index] = "--";
+        @memcpy(extended[(separator_index + 1)..], command);
+
+        var child = std.process.Child.init(extended, allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+        return process.pidFromChildId(child.id);
+    }
+
+    var child = std.process.Child.init(args, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    return process.pidFromChildId(child.id);
+}
+
+fn runStartWindows(allocator: std.mem.Allocator, options: cli.StartOptions) !u8 {
+    const root = try state_dir.ensureLayout(allocator);
+    defer allocator.free(root);
+
+    const id = if (options.id) |provided| try allocator.dupe(u8, provided) else try allocator.dupe(u8, "main");
+    defer allocator.free(id);
+
+    const shell_dir = try state_dir.ensureShellDir(allocator, root, id);
+    defer allocator.free(shell_dir);
+
+    const lock_result = try locks.acquire(allocator, shell_dir, .start);
+    if (lock_result == .busy) {
+        try output.printError("shell start is already in progress");
+        return 1;
+    }
+    defer locks.release(allocator, shell_dir, .start) catch {};
+
+    try registry.revalidateAndPrune(allocator, root);
+    if (try registry.readOne(allocator, root, id)) |record| {
+        defer registry.freeRecord(allocator, record);
+        try output.printError("shell id already exists");
+        return 1;
+    }
+
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+
+    try spawnBrokerWindows(allocator, root, id, cwd, options.command);
     if (!try waitForShellReady(allocator, root, id)) {
         if (try registry.readOne(allocator, root, id)) |record| {
             defer registry.freeRecord(allocator, record);
@@ -137,7 +355,7 @@ fn runStart(allocator: std.mem.Allocator, options: cli.StartOptions) !u8 {
     return 0;
 }
 
-fn runStop(allocator: std.mem.Allocator, id: []const u8) !u8 {
+fn runStopWindows(allocator: std.mem.Allocator, id: []const u8) !u8 {
     const root = try state_dir.ensureLayout(allocator);
     defer allocator.free(root);
 
@@ -170,7 +388,7 @@ fn runStop(allocator: std.mem.Allocator, id: []const u8) !u8 {
     return 0;
 }
 
-fn runExec(allocator: std.mem.Allocator, options: cli.ExecOptions) !u8 {
+fn runExecWindows(allocator: std.mem.Allocator, options: cli.ExecOptions) !u8 {
     const root = try state_dir.ensureLayout(allocator);
     defer allocator.free(root);
     try registry.revalidateAndPrune(allocator, root);
@@ -286,7 +504,7 @@ fn runExec(allocator: std.mem.Allocator, options: cli.ExecOptions) !u8 {
     return 0;
 }
 
-fn spawnBroker(allocator: std.mem.Allocator, root: []const u8, id: []const u8, cwd: []const u8, command: []const []const u8) !void {
+fn spawnBrokerWindows(allocator: std.mem.Allocator, root: []const u8, id: []const u8, cwd: []const u8, command: []const []const u8) !void {
     const self_path = try std.fs.selfExePathAlloc(allocator);
     defer allocator.free(self_path);
 
@@ -323,7 +541,98 @@ fn spawnBroker(allocator: std.mem.Allocator, root: []const u8, id: []const u8, c
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
     try child.spawn();
-    return;
+}
+
+const StartupWaitResult = union(enum) {
+    ready,
+    err: []u8,
+    timeout,
+    closed,
+};
+
+const StreamFrame = union(enum) {
+    stdout: []u8,
+    stderr: []u8,
+    complete: ipc.Completion,
+    stopped,
+    err: []u8,
+    timeout,
+    closed,
+};
+
+fn waitForListenerFrame(allocator: std.mem.Allocator, server: *std.net.Server, timeout_ms: i64) !StartupWaitResult {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (true) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline) return .timeout;
+        if (!(try tryWaitReadable(server.stream.handle, deadline - now))) return .timeout;
+
+        var connection = try server.accept();
+        defer connection.stream.close();
+
+        const frame = ipc.readFrame(allocator, &connection.stream, 4096) catch |err| switch (err) {
+            error.EndOfStream => return .closed,
+            else => return err,
+        } orelse return .closed;
+        defer allocator.free(frame.payload);
+
+        switch (frame.kind) {
+            .ready => return .ready,
+            .err => return .{ .err = try allocator.dupe(u8, frame.payload) },
+            else => return .closed,
+        }
+    }
+}
+
+fn waitForStreamFrame(allocator: std.mem.Allocator, stream: *std.net.Stream, timeout_ms: i64) !StreamFrame {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (true) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline) return .timeout;
+        if (!(try tryWaitReadable(stream.handle, deadline - now))) return .timeout;
+
+        const frame = ipc.readFrame(allocator, stream, 1024 * 1024) catch |err| switch (err) {
+            error.EndOfStream => return .closed,
+            else => return err,
+        } orelse return .closed;
+
+        switch (frame.kind) {
+            .exec, .stop => {
+                allocator.free(frame.payload);
+                return .closed;
+            },
+            .stdout => return .{ .stdout = frame.payload },
+            .stderr => return .{ .stderr = frame.payload },
+            .complete => {
+                const completion = try ipc.decodeCompletion(frame.payload);
+                allocator.free(frame.payload);
+                return .{ .complete = completion };
+            },
+            .stopped => {
+                allocator.free(frame.payload);
+                return .stopped;
+            },
+            .err => return .{ .err = frame.payload },
+            .ready => {
+                allocator.free(frame.payload);
+                return .closed;
+            },
+        }
+    }
+}
+
+fn tryWaitReadable(fd: std.posix.fd_t, timeout_ms: i64) !bool {
+    if (builtin.os.tag == .windows) {
+        return false;
+    }
+    if (timeout_ms <= 0) return false;
+    var fds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const rc = try std.posix.poll(&fds, @intCast(timeout_ms));
+    return rc > 0;
 }
 
 fn waitForShellReady(allocator: std.mem.Allocator, root: []const u8, id: []const u8) !bool {
