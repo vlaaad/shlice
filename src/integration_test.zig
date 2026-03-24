@@ -104,6 +104,85 @@ test "start osc repl, exec twice, stop" {
     stop_needed = false;
 }
 
+test "stop allows immediate restart" {
+    reportTest("stop allows immediate restart");
+    const allocator = std.testing.allocator;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const shlice_exe = try findShliceExe(allocator);
+    defer allocator.free(shlice_exe);
+
+    const clj_exe = try process.resolveExecutable(allocator, "clj");
+    defer allocator.free(clj_exe);
+    const clojure_exe = process.resolveExecutable(allocator, "clojure") catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (clojure_exe) |path| allocator.free(path);
+
+    const workspace_root = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_root);
+
+    const osc_repl = "osc-repl.clj";
+
+    const sandbox = try createSandbox(allocator, workspace_root);
+    defer sandbox.deinit();
+
+    var env = try std.process.getEnvMap(allocator);
+    defer env.deinit();
+
+    try configureEnv(&env, sandbox.root, sandbox.home);
+
+    const shell_id = "osc-repl-restart-test";
+
+    var stop_needed = false;
+    defer if (stop_needed) {
+        if (runCommand(allocator, &env, workspace_root, &.{ shlice_exe, "stop", shell_id })) |stop_result| {
+            defer stop_result.deinit(allocator);
+        } else |_| {}
+    };
+
+    const start_result = try startRepl(allocator, &env, workspace_root, shlice_exe, shell_id, osc_repl, clj_exe, clojure_exe);
+    defer start_result.deinit(allocator);
+    try expectExitCode(start_result.term, 0, start_result.stdout, start_result.stderr);
+    stop_needed = true;
+
+    const stop_result = try runCommand(allocator, &env, workspace_root, &.{ shlice_exe, "stop", shell_id });
+    defer stop_result.deinit(allocator);
+    try expectExitCode(stop_result.term, 0, stop_result.stdout, stop_result.stderr);
+    stop_needed = false;
+
+    const restart_result = try startRepl(allocator, &env, workspace_root, shlice_exe, shell_id, osc_repl, clj_exe, clojure_exe);
+    defer restart_result.deinit(allocator);
+    try expectExitCode(restart_result.term, 0, restart_result.stdout, restart_result.stderr);
+    const restart_stdout = try normalizeNewlinesOwned(allocator, restart_result.stdout);
+    defer allocator.free(restart_stdout);
+    const restart_stderr = try normalizeNewlinesOwned(allocator, restart_result.stderr);
+    defer allocator.free(restart_stderr);
+    try std.testing.expectEqualStrings("started osc-repl-restart-test\n", restart_stdout);
+    try std.testing.expectEqualStrings("", restart_stderr);
+
+    const exec_result = try runCommand(allocator, &env, workspace_root, &.{ shlice_exe, "exec", "--id", shell_id, "(* 6 7)" });
+    defer exec_result.deinit(allocator);
+    try expectExitCode(exec_result.term, 0, exec_result.stdout, exec_result.stderr);
+    const exec_stdout = try normalizeNewlinesOwned(allocator, exec_result.stdout);
+    defer allocator.free(exec_stdout);
+    const exec_stderr = try normalizeNewlinesOwned(allocator, exec_result.stderr);
+    defer allocator.free(exec_stderr);
+    try std.testing.expectEqualStrings("42\n", exec_stdout);
+    try std.testing.expectEqualStrings("", exec_stderr);
+
+    const final_stop = try runCommand(allocator, &env, workspace_root, &.{ shlice_exe, "stop", shell_id });
+    defer final_stop.deinit(allocator);
+    try expectExitCode(final_stop.term, 0, final_stop.stdout, final_stop.stderr);
+    const final_stop_stdout = try normalizeNewlinesOwned(allocator, final_stop.stdout);
+    defer allocator.free(final_stop_stdout);
+    const final_stop_stderr = try normalizeNewlinesOwned(allocator, final_stop.stderr);
+    defer allocator.free(final_stop_stderr);
+    try std.testing.expectEqualStrings("stopped osc-repl-restart-test\n", final_stop_stdout);
+    try std.testing.expectEqualStrings("", final_stop_stderr);
+}
+
 test "exec incomplete command times out and shell recovers" {
     reportTest("exec incomplete command times out and shell recovers");
     const allocator = std.testing.allocator;

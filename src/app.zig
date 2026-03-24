@@ -239,6 +239,7 @@ fn runStop(allocator: std.mem.Allocator, id: []const u8) !u8 {
             try output.printError("stop timed out");
             return 124;
         }
+        try cleanupShellState(allocator, root, id);
         try output.printStopped(id);
         return 0;
     };
@@ -246,6 +247,7 @@ fn runStop(allocator: std.mem.Allocator, id: []const u8) !u8 {
 
     switch (result.kind) {
         .stopped => {
+            try cleanupShellState(allocator, root, id);
             try output.printStopped(id);
             return 0;
         },
@@ -275,7 +277,15 @@ fn runExec(allocator: std.mem.Allocator, options: cli.ExecOptions) !u8 {
     const record = maybe_record.?;
     defer registry.freeRecord(allocator, record);
 
-    const command = if (options.command) |value| try allocator.dupe(u8, value) else try readCommandFromStdin(allocator);
+    const command = if (options.command) |value| blk: {
+        break :blk try allocator.dupe(u8, value);
+    } else blk: {
+        if (std.posix.isatty(std.io.getStdIn().handle)) {
+            try output.printError("missing command");
+            return 1;
+        }
+        break :blk try readCommandFromStdin(allocator);
+    };
     defer allocator.free(command);
     if (command.len == 0) {
         try output.printError("missing command");
@@ -574,6 +584,7 @@ fn runStopWindows(allocator: std.mem.Allocator, id: []const u8) !u8 {
         try cleanupShellState(allocator, root, id);
     }
 
+    try cleanupShellState(allocator, root, id);
     try output.printStopped(id);
     return 0;
 }
@@ -638,7 +649,15 @@ fn runExecWindows(allocator: std.mem.Allocator, options: cli.ExecOptions) !u8 {
         std.time.sleep(50 * std.time.ns_per_ms);
     }
 
-    const command = if (options.command) |value| try allocator.dupe(u8, value) else try readCommandFromStdin(allocator);
+    const command = if (options.command) |value| blk: {
+        break :blk try allocator.dupe(u8, value);
+    } else blk: {
+        if (std.posix.isatty(std.io.getStdIn().handle)) {
+            try output.printError("missing command");
+            return 1;
+        }
+        break :blk try readCommandFromStdin(allocator);
+    };
     defer allocator.free(command);
     if (command.len == 0) {
         try output.printError("missing command");
