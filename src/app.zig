@@ -1,5 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const libc = if (builtin.link_libc) @cImport({
+    @cInclude("unistd.h");
+}) else struct {};
 const windows = std.os.windows;
 const broker = @import("broker.zig");
 const cli = @import("cli.zig");
@@ -395,6 +398,8 @@ fn runExec(allocator: std.mem.Allocator, options: cli.ExecOptions) !u8 {
 }
 
 fn spawnBroker(allocator: std.mem.Allocator, root: []const u8, id: []const u8, cwd: []const u8, ready_socket: []const u8, command: []const []const u8) !u32 {
+    if (builtin.os.tag == .windows) return spawnBrokerWindows(allocator, root, id, cwd, ready_socket, command);
+
     const self_path = try std.fs.selfExePathAlloc(allocator);
     defer allocator.free(self_path);
 
@@ -419,21 +424,82 @@ fn spawnBroker(allocator: std.mem.Allocator, root: []const u8, id: []const u8, c
         @memcpy(extended[0..10], args[0..10]);
         extended[separator_index] = "--";
         @memcpy(extended[(separator_index + 1)..], command);
-
-        var child = std.process.Child.init(extended, allocator);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
-        return process.pidFromChildId(child.id);
+        return spawnDetachedPosixProcess(allocator, extended, cwd);
     }
 
-    var child = std.process.Child.init(args, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    return process.pidFromChildId(child.id);
+    return spawnDetachedPosixProcess(allocator, args, cwd);
+}
+
+fn spawnDetachedPosixProcess(allocator: std.mem.Allocator, argv: []const []const u8, cwd: []const u8) !u32 {
+    var arena_allocator = std.heap.ArenaAllocator.init(allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const argv_buf = try arena.allocSentinel(?[*:0]const u8, argv.len, null);
+    for (argv, 0..) |arg, index| argv_buf[index] = (try arena.dupeZ(u8, arg)).ptr;
+
+    const envp = if (builtin.link_libc) blk: {
+        break :blk (try std.process.createEnvironFromExisting(arena, std.c.environ, .{})).ptr;
+    } else if (builtin.output_mode == .Exe) blk: {
+        break :blk (try std.process.createEnvironFromExisting(arena, @ptrCast(std.os.environ.ptr), .{})).ptr;
+    } else {
+        @compileError("missing std lib enhancement: cannot collect environment variables for spawnDetachedPosixProcess");
+    };
+
+    const err_pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
+    errdefer destroyPipe(err_pipe);
+
+    const pid_result = try std.posix.fork();
+    if (pid_result == 0) {
+        // We are the child. Detach from the parent's process group so the
+        // shell spawned by exec_command can be torn down without killing us.
+        if (builtin.link_libc) {
+            const rc = libc.setsid();
+            const err = std.posix.errno(rc);
+            if (err != .SUCCESS) forkChildErrReport(err_pipe[1], @errorFromInt(@as(u16, @intCast(@intFromEnum(err)))));
+        } else if (builtin.os.tag == .linux) {
+            const rc = std.os.linux.setsid();
+            const err = std.posix.errno(rc);
+            if (err != .SUCCESS) forkChildErrReport(err_pipe[1], @errorFromInt(@as(u16, @intCast(@intFromEnum(err)))));
+        } else {
+            @compileError("missing setsid support for detached child spawn");
+        }
+        std.posix.chdir(cwd) catch |err| forkChildErrReport(err_pipe[1], err);
+        const err = std.posix.execvpeZ_expandArg0(.no_expand, argv_buf.ptr[0].?, argv_buf.ptr, envp);
+        forkChildErrReport(err_pipe[1], err);
+    }
+
+    std.posix.close(err_pipe[1]);
+    const child_pid: u32 = @intCast(pid_result);
+
+    const maybe_err = readSpawnErrorFd(err_pipe[0]) catch |err| switch (err) {
+        error.EndOfStream => return child_pid,
+        else => return err,
+    };
+    return @errorFromInt(@as(u16, @intCast(maybe_err)));
+}
+
+fn readSpawnErrorFd(fd: std.posix.fd_t) !u64 {
+    const file: std.fs.File = .{ .handle = fd };
+    return file.reader().readInt(u64, .little);
+}
+
+fn destroyPipe(pipe: [2]std.posix.fd_t) void {
+    if (pipe[0] != -1) std.posix.close(pipe[0]);
+    if (pipe[0] != pipe[1]) std.posix.close(pipe[1]);
+}
+
+fn forkChildErrReport(fd: i32, err: anyerror) noreturn {
+    writeIntFd(fd, @as(u64, @intFromError(err))) catch {};
+    if (builtin.link_libc) {
+        std.c._exit(1);
+    }
+    std.posix.exit(1);
+}
+
+fn writeIntFd(fd: i32, value: u64) !void {
+    const file: std.fs.File = .{ .handle = fd };
+    try file.writer().writeInt(u64, value, .little);
 }
 
 const TimedCloseGuard = struct {
