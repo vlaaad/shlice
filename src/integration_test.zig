@@ -13,7 +13,12 @@ const CommandResult = struct {
     }
 };
 
+fn reportTest(name: []const u8) void {
+    std.debug.print("test: {s}\n", .{name});
+}
+
 test "start osc repl, exec twice, stop" {
+    reportTest("start osc repl, exec twice, stop");
     const allocator = std.testing.allocator;
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -100,6 +105,7 @@ test "start osc repl, exec twice, stop" {
 }
 
 test "exec incomplete command times out and shell recovers" {
+    reportTest("exec incomplete command times out and shell recovers");
     const allocator = std.testing.allocator;
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -163,6 +169,7 @@ test "exec incomplete command times out and shell recovers" {
 }
 
 test "exec requests are serialized" {
+    reportTest("exec requests are serialized");
     const allocator = std.testing.allocator;
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -204,6 +211,7 @@ test "exec requests are serialized" {
     try expectExitCode(start_result.term, 0, start_result.stdout, start_result.stderr);
     stop_needed = true;
 
+    std.debug.print("phase: first exec\n", .{});
     const first_argv = &.{
         shlice_exe,
         "exec",
@@ -219,6 +227,7 @@ test "exec requests are serialized" {
         "(do (println \"two\") :second)",
     };
 
+    std.debug.print("phase: second exec\n", .{});
     var first_ctx = AsyncRun{ .env = &env, .cwd = workspace_root, .argv = first_argv };
     var second_ctx = AsyncRun{ .env = &env, .cwd = workspace_root, .argv = second_argv };
 
@@ -251,6 +260,7 @@ test "exec requests are serialized" {
 }
 
 test "exec requests stay serialized under contention" {
+    reportTest("exec requests stay serialized under contention");
     const allocator = std.testing.allocator;
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -294,6 +304,7 @@ test "exec requests stay serialized under contention" {
 
     const thread_count = 8;
     const sleep_ms = 200;
+    std.debug.print("phase: spawn contention execs\n", .{});
     var gate = StartGate{ .total = thread_count };
     var runs: [thread_count]HammerRun = undefined;
     var threads: [thread_count]std.Thread = undefined;
@@ -323,6 +334,7 @@ test "exec requests stay serialized under contention" {
         threads[i] = try std.Thread.spawn(.{}, HammerRun.run, .{ &runs[i] });
     }
 
+    std.debug.print("phase: join contention execs\n", .{});
     for (0..thread_count) |i| {
         threads[i].join();
     }
@@ -355,7 +367,49 @@ test "exec requests stay serialized under contention" {
     try std.testing.expect(max_duration - min_duration >= @as(i64, (thread_count - 1) * sleep_ms - 250));
 }
 
+test "non-start commands do not create state root" {
+    reportTest("non-start commands do not create state root");
+    const allocator = std.testing.allocator;
+
+    const shlice_exe = try findShliceExe(allocator);
+    defer allocator.free(shlice_exe);
+
+    const workspace_root = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_root);
+
+    const sandbox = try createSandbox(allocator, workspace_root);
+    defer sandbox.deinit();
+
+    const cwd = try std.fs.path.join(allocator, &.{ sandbox.root, "no-state" });
+    defer allocator.free(cwd);
+    try std.fs.makeDirAbsolute(cwd);
+
+    var env = try std.process.getEnvMap(allocator);
+    defer env.deinit();
+    try configureEnv(&env, sandbox.root, sandbox.home);
+
+    const root = try std.fs.path.join(allocator, &.{ cwd, ".shlice" });
+    defer allocator.free(root);
+    try std.testing.expect(!pathExists(root));
+
+    const list_result = try runCommand(allocator, &env, cwd, &.{ shlice_exe, "list" });
+    defer list_result.deinit(allocator);
+    try expectExitCode(list_result.term, 0, list_result.stdout, list_result.stderr);
+    try std.testing.expect(!pathExists(root));
+
+    const exec_result = try runCommand(allocator, &env, cwd, &.{ shlice_exe, "exec", "--id", "missing", "(+ 1 2)" });
+    defer exec_result.deinit(allocator);
+    try expectExitCode(exec_result.term, 1, exec_result.stdout, exec_result.stderr);
+    try std.testing.expect(!pathExists(root));
+
+    const stop_result = try runCommand(allocator, &env, cwd, &.{ shlice_exe, "stop", "missing" });
+    defer stop_result.deinit(allocator);
+    try expectExitCode(stop_result.term, 1, stop_result.stdout, stop_result.stderr);
+    try std.testing.expect(!pathExists(root));
+}
+
 test "stop rejects queued exec" {
+    reportTest("stop rejects queued exec");
     const allocator = std.testing.allocator;
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -412,19 +466,23 @@ test "stop rejects queued exec" {
         "(do (println \"queued\") :second)",
     };
 
+    std.debug.print("phase: spawn long exec\n", .{});
     var long_ctx = AsyncRun{ .env = &env, .cwd = workspace_root, .argv = long_argv };
     var queued_ctx = AsyncRun{ .env = &env, .cwd = workspace_root, .argv = queued_argv };
 
     var long_thread = try std.Thread.spawn(.{}, AsyncRun.run, .{ &long_ctx });
     std.time.sleep(100 * std.time.ns_per_ms);
+    std.debug.print("phase: spawn queued exec\n", .{});
     var queued_thread = try std.Thread.spawn(.{}, AsyncRun.run, .{ &queued_ctx });
 
     std.time.sleep(200 * std.time.ns_per_ms);
+    std.debug.print("phase: send stop\n", .{});
     const stop_result = try runCommand(allocator, &env, workspace_root, &.{ shlice_exe, "stop", shell_id });
     defer stop_result.deinit(allocator);
     try expectExitCode(stop_result.term, 0, stop_result.stdout, stop_result.stderr);
     stop_needed = false;
 
+    std.debug.print("phase: join stop test execs\n", .{});
     long_thread.join();
     queued_thread.join();
 
@@ -453,6 +511,7 @@ test "stop rejects queued exec" {
 }
 
 test "start fails fast on missing shell command" {
+    reportTest("start fails fast on missing shell command");
     const allocator = std.testing.allocator;
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -678,6 +737,11 @@ fn expectExitCode(term: std.process.Child.Term, expected: u8, stdout: []const u8
 
 fn normalizeNewlinesOwned(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     return std.mem.replaceOwned(u8, allocator, bytes, "\r\n", "\n");
+}
+
+fn pathExists(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
 }
 
 fn deleteTreeAbsolute(path: []const u8) !void {

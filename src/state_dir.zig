@@ -1,17 +1,20 @@
 const std = @import("std");
-
 pub fn appDataDir(allocator: std.mem.Allocator) ![]u8 {
-    return std.fs.getAppDataDir(allocator, "shlice");
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    return std.fs.path.join(allocator, &.{ cwd, ".shlice" });
+}
+
+pub fn existsPath(root: []const u8) !bool {
+    std.fs.accessAbsolute(root, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 pub fn ipcSocketPath(allocator: std.mem.Allocator, root: []const u8, shell_id: []const u8, name: []const u8) ![]u8 {
-    var hash: u64 = 0xcbf29ce484222325;
-    hash = fnv1a(hash, root);
-    hash = fnv1a(hash, "/");
-    hash = fnv1a(hash, shell_id);
-    hash = fnv1a(hash, "/");
-    hash = fnv1a(hash, name);
-    return std.fmt.allocPrint(allocator, "/tmp/shlice-{x}.sock", .{hash});
+    return std.fs.path.join(allocator, &.{ root, "shells", shell_id, name });
 }
 
 pub fn ensureLayout(allocator: std.mem.Allocator) ![]u8 {
@@ -22,6 +25,17 @@ pub fn ensureLayout(allocator: std.mem.Allocator) ![]u8 {
         error.PathAlreadyExists => {},
         else => return err,
     };
+
+    const gitignore_path = try std.fs.path.join(allocator, &.{ root, ".gitignore" });
+    defer allocator.free(gitignore_path);
+    const gitignore_file = std.fs.createFileAbsolute(gitignore_path, .{ .exclusive = true, .truncate = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => null,
+        else => return err,
+    };
+    if (gitignore_file) |file| {
+        defer file.close();
+        try file.writeAll("*\n");
+    }
 
     const registry_dir = try std.fs.path.join(allocator, &.{ root, "registry" });
     defer allocator.free(registry_dir);

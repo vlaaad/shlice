@@ -15,6 +15,8 @@ DIST = ROOT / "dist"
 WORKFLOW_NAME = "Zig CI"
 POLL_SECONDS = 3
 POLL_TIMEOUT_SECONDS = 180
+WATCH_TIMEOUT_SECONDS = 900
+WATCH_STALE_WARN_SECONDS = 180
 
 
 def run(
@@ -37,6 +39,107 @@ def run(
         )
         raise RuntimeError(f"{command}: {message}")
     return result
+
+
+def run_json(*args: str) -> object:
+    return json.loads(run(*args).stdout)
+
+
+def current_step_name(job: object) -> str | None:
+    if not isinstance(job, dict):
+        return None
+    for step in job.get("steps", []):
+        if isinstance(step, dict) and step.get("status") == "in_progress":
+            name = step.get("name")
+            if isinstance(name, str):
+                return name
+    for step in job.get("steps", []):
+        if isinstance(step, dict) and step.get("status") == "pending":
+            name = step.get("name")
+            if isinstance(name, str):
+                return name
+    return None
+
+
+def print_run_snapshot(run_info: object, jobs_info: object) -> None:
+    if not isinstance(run_info, dict) or not isinstance(jobs_info, dict):
+        return
+
+    status = run_info.get("status")
+    conclusion = run_info.get("conclusion")
+    print(f"run status: {status} {conclusion or ''}".rstrip(), flush=True)
+
+    jobs = jobs_info.get("jobs", [])
+    if not isinstance(jobs, list):
+        return
+    for job in sorted(jobs, key=lambda item: item.get("id", 0) if isinstance(item, dict) else 0):
+        if not isinstance(job, dict):
+            continue
+        name = job.get("name", "<unknown>")
+        job_status = job.get("status")
+        job_conclusion = job.get("conclusion")
+        if job_status == "completed":
+            prefix = "✓" if job_conclusion == "success" else "!"
+            suffix = f" ({job_conclusion})" if job_conclusion else ""
+        else:
+            prefix = "*"
+            step_name = current_step_name(job)
+            suffix = f" - {step_name}" if step_name else ""
+        print(f"{prefix} {name}{suffix}", flush=True)
+
+
+def watch_run(repo: str, run_id: int) -> int:
+    last_snapshot: str | None = None
+    last_change = time.monotonic()
+    warned = False
+    deadline = time.monotonic() + WATCH_TIMEOUT_SECONDS
+
+    while True:
+        run_info = run_json("gh", "api", f"repos/{repo}/actions/runs/{run_id}")
+        jobs_info = run_json("gh", "api", f"repos/{repo}/actions/runs/{run_id}/jobs")
+        snapshot = json.dumps({"run": run_info, "jobs": jobs_info}, sort_keys=True)
+        if snapshot != last_snapshot:
+            print_run_snapshot(run_info, jobs_info)
+            last_snapshot = snapshot
+            last_change = time.monotonic()
+            warned = False
+
+        if isinstance(run_info, dict) and run_info.get("status") == "completed":
+            return 0 if run_info.get("conclusion") == "success" else 1
+
+        idle_seconds = time.monotonic() - last_change
+        if idle_seconds >= WATCH_STALE_WARN_SECONDS and not warned:
+            active = None
+            if isinstance(jobs_info, dict):
+                for job in jobs_info.get("jobs", []):
+                    active = current_step_name(job)
+                    if active is not None:
+                        job_name = job.get("name", "<unknown>") if isinstance(job, dict) else "<unknown>"
+                        break
+                else:
+                    job_name = None
+            else:
+                job_name = None
+            if active is not None and job_name is not None:
+                print(
+                    f"warning: no CI progress for {int(idle_seconds)}s; {job_name} is at {active}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"warning: no CI progress for {int(idle_seconds)}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            warned = True
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"workflow run {run_id} exceeded {WATCH_TIMEOUT_SECONDS}s without completing"
+            )
+
+        time.sleep(POLL_SECONDS)
 
 
 def main() -> int:
@@ -155,11 +258,7 @@ def main() -> int:
         ).stdout.strip()
         print(f"run: {url}", flush=True)
 
-        watch = subprocess.run(
-            ["gh", "run", "watch", str(run_id), "--exit-status"],
-            cwd=ROOT,
-            check=False,
-        )
+        watch = watch_run(repo, run_id)
         conclusion = run(
             "gh",
             "api",
@@ -168,7 +267,7 @@ def main() -> int:
             ".conclusion // .status",
         ).stdout.strip()
         print(f"result: {conclusion}", flush=True)
-        if watch.returncode == 0:
+        if watch == 0:
             try:
                 if DIST.exists():
                     shutil.rmtree(DIST, ignore_errors=False)
@@ -179,7 +278,7 @@ def main() -> int:
                 ) from exc
             print(f"downloading artifacts to {DIST}...", flush=True)
             run("gh", "run", "download", str(run_id), "--dir", str(DIST))
-        return watch.returncode
+        return watch
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130

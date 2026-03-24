@@ -6,12 +6,12 @@ pub const command_begin_marker = "\x1b]133;C\x07";
 pub const command_done_prefix = "\x1b]133;D;";
 
 pub const Request = struct {
-    id: []const u8,
-    command: []const u8,
+    id: []u8,
+    command: []u8,
 };
 
 pub const Completion = struct {
-    id: []const u8,
+    id: []u8,
     exit_code: i32,
     timed_out: bool,
 };

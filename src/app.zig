@@ -55,8 +55,12 @@ pub fn run(allocator: std.mem.Allocator) !u8 {
 }
 
 fn runList(allocator: std.mem.Allocator) !void {
-    const root = try state_dir.ensureLayout(allocator);
+    const root = try state_dir.appDataDir(allocator);
     defer allocator.free(root);
+    if (!try state_dir.existsPath(root)) {
+        try output.printNoShells(std.io.getStdOut().writer());
+        return;
+    }
     try registry.revalidateAndPrune(allocator, root);
 
     const records = try registry.listAll(allocator, root);
@@ -74,8 +78,16 @@ fn runList(allocator: std.mem.Allocator) !void {
 }
 
 fn runStatus(allocator: std.mem.Allocator, id: ?[]const u8) !u8 {
-    const root = try state_dir.ensureLayout(allocator);
+    const root = try state_dir.appDataDir(allocator);
     defer allocator.free(root);
+    if (!try state_dir.existsPath(root)) {
+        if (id) |_| {
+            try output.printError("shell not found");
+            return 1;
+        }
+        try output.printNoShells(std.io.getStdOut().writer());
+        return 0;
+    }
     try registry.revalidateAndPrune(allocator, root);
 
     if (id) |shell| {
@@ -124,14 +136,15 @@ fn runStart(allocator: std.mem.Allocator, options: cli.StartOptions) !u8 {
     const cwd = try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd);
 
-    const ready_socket = try state_dir.ipcSocketPath(allocator, root, id, "startup");
+    const ready_socket = try state_dir.ipcSocketPath(allocator, root, id, "startup.fifo");
     defer allocator.free(ready_socket);
 
-    var ready_server = try ipc.bindUnixServer(ready_socket);
-    defer ready_server.deinit();
+    try ipc.createFifo(allocator, ready_socket);
+    errdefer std.fs.deleteFileAbsolute(ready_socket) catch {};
 
     const broker_pid = try spawnBroker(allocator, root, id, cwd, ready_socket, options.command);
-    const ready_result = try waitForListenerFrame(allocator, &ready_server, shell_ready_timeout_ms);
+    var ready_file = try ipc.openFifoReadWrite(ready_socket);
+    const ready_result = try waitForStartupFrame(allocator, &ready_file, shell_ready_timeout_ms);
     switch (ready_result) {
         .ready => {
             try output.printStarted(id);
@@ -155,8 +168,12 @@ fn runStart(allocator: std.mem.Allocator, options: cli.StartOptions) !u8 {
 fn runStop(allocator: std.mem.Allocator, id: []const u8) !u8 {
     if (builtin.os.tag == .windows) return runStopWindows(allocator, id);
 
-    const root = try state_dir.ensureLayout(allocator);
+    const root = try state_dir.appDataDir(allocator);
     defer allocator.free(root);
+    if (!try state_dir.existsPath(root)) {
+        try output.printError("shell not found");
+        return 1;
+    }
 
     const maybe_record = try registry.readOne(allocator, root, id);
     if (maybe_record == null) {
@@ -166,31 +183,74 @@ fn runStop(allocator: std.mem.Allocator, id: []const u8) !u8 {
     const record = maybe_record.?;
     defer registry.freeRecord(allocator, record);
 
-    const control_path = try state_dir.ipcSocketPath(allocator, root, id, "control");
+    const shell_dir = try state_dir.ensureShellDir(allocator, root, id);
+    defer allocator.free(shell_dir);
+
+    const lock_result = try locks.acquire(allocator, shell_dir, .exec);
+    if (lock_result == .busy) {
+        try output.printError("shell is busy");
+        return 1;
+    }
+    var lock_held = true;
+    defer if (lock_held) locks.release(allocator, shell_dir, .exec) catch {};
+
+    const control_path = try state_dir.ipcSocketPath(allocator, root, id, "control.fifo");
     defer allocator.free(control_path);
 
-    var stream = ipc.connectUnixStream(control_path) catch {
+    var stream = ipc.openFifoReadWrite(control_path) catch {
         try output.printError("shell not found");
         return 1;
     };
     defer stream.close();
 
-    try ipc.sendFrame(&stream, .stop, &.{});
+    const request_id = try shell_id.generate(allocator);
+    defer allocator.free(request_id);
+    const request_body = try protocol.stringifyRequest(allocator, .{ .id = request_id, .command = "" });
+    defer allocator.free(request_body);
+    const reply_name = try std.fmt.allocPrint(allocator, "reply-{s}.fifo", .{request_id});
+    defer allocator.free(reply_name);
+    const request_path = try state_dir.shellFilePath(allocator, root, id, reply_name);
+    defer allocator.free(request_path);
+    try ipc.createFifo(allocator, request_path);
 
-    const result = try waitForStreamFrame(allocator, &stream, 5000);
-    switch (result) {
-        .stopped, .closed => {
+    var reply = try ipc.openFifoReadWrite(request_path);
+    var guard = TimedCloseGuard{ .file = &reply };
+    var request_sent = false;
+    defer if (!request_sent) std.fs.deleteFileAbsolute(request_path) catch {};
+
+    try ipc.sendFrameFile(&stream, .stop, request_body);
+    request_sent = true;
+    locks.release(allocator, shell_dir, .exec) catch {};
+    lock_held = false;
+
+    var timer = try std.Thread.spawn(.{}, deadlineCloser, .{ &guard, std.time.milliTimestamp() + 5000 });
+    defer {
+        finishTimedCloseGuard(&guard);
+        timer.join();
+        closeTimedCloseGuardIfOpen(&guard);
+    }
+
+    const result = ipc.readFrameFile(allocator, &reply, 1024 * 1024) catch |err| switch (err) {
+        error.EndOfStream => null,
+        else => if (timedCloseGuardIsClosed(&guard)) null else return err,
+    } orelse {
+        if (timedCloseGuardIsClosed(&guard)) {
+            try output.printError("stop timed out");
+            return 124;
+        }
+        try output.printStopped(id);
+        return 0;
+    };
+    defer allocator.free(result.payload);
+
+    switch (result.kind) {
+        .stopped => {
             try output.printStopped(id);
             return 0;
         },
-        .err => |message| {
-            defer allocator.free(message);
-            try output.printError(message);
+        .err => {
+            try output.printError(result.payload);
             return 1;
-        },
-        .timeout => {
-            try output.printError("stop timed out");
-            return 124;
         },
         else => return error.InvalidData,
     }
@@ -199,8 +259,12 @@ fn runStop(allocator: std.mem.Allocator, id: []const u8) !u8 {
 fn runExec(allocator: std.mem.Allocator, options: cli.ExecOptions) !u8 {
     if (builtin.os.tag == .windows) return runExecWindows(allocator, options);
 
-    const root = try state_dir.ensureLayout(allocator);
+    const root = try state_dir.appDataDir(allocator);
     defer allocator.free(root);
+    if (!try state_dir.existsPath(root)) {
+        try output.printError("shell not found");
+        return 1;
+    }
 
     const maybe_record = try registry.readOne(allocator, root, options.id);
     if (maybe_record == null) {
@@ -217,53 +281,103 @@ fn runExec(allocator: std.mem.Allocator, options: cli.ExecOptions) !u8 {
         return 1;
     }
 
-    const control_path = try state_dir.ipcSocketPath(allocator, root, options.id, "control");
+    const shell_dir = try state_dir.ensureShellDir(allocator, root, options.id);
+    defer allocator.free(shell_dir);
+
+    const lock_deadline = std.time.milliTimestamp() + @as(i64, @intCast(options.timeout_seconds)) * 1000;
+    while (true) {
+        const lock_result = try locks.acquire(allocator, shell_dir, .exec);
+        if (lock_result != .busy) break;
+        if (std.time.milliTimestamp() >= lock_deadline) {
+            try output.printError("exec timed out waiting for shell");
+            return 124;
+        }
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+    var lock_held = true;
+    defer if (lock_held) locks.release(allocator, shell_dir, .exec) catch {};
+
+    const control_path = try state_dir.ipcSocketPath(allocator, root, options.id, "control.fifo");
     defer allocator.free(control_path);
 
-    var stream = ipc.connectUnixStream(control_path) catch {
+    var stream = ipc.openFifoReadWrite(control_path) catch {
         try output.printError("shell not found");
         return 1;
     };
     defer stream.close();
 
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(options.timeout_seconds)) * 1000;
-    try ipc.sendFrame(&stream, .exec, command);
+    const request_id = try shell_id.generate(allocator);
+    defer allocator.free(request_id);
+    const request_body = try protocol.stringifyRequest(allocator, .{ .id = request_id, .command = command });
+    defer allocator.free(request_body);
+    const reply_name = try std.fmt.allocPrint(allocator, "reply-{s}.fifo", .{request_id});
+    defer allocator.free(reply_name);
+    const reply_path = try state_dir.shellFilePath(allocator, root, options.id, reply_name);
+    defer allocator.free(reply_path);
+    try ipc.createFifo(allocator, reply_path);
+
+    var reply = try ipc.openFifoReadWrite(reply_path);
+    var guard = TimedCloseGuard{ .file = &reply };
+    var request_sent = false;
+    defer if (!request_sent) std.fs.deleteFileAbsolute(reply_path) catch {};
+
+    try ipc.sendFrameFile(&stream, .exec, request_body);
+    request_sent = true;
+    locks.release(allocator, shell_dir, .exec) catch {};
+    lock_held = false;
+
+    var timer = try std.Thread.spawn(.{}, deadlineCloser, .{ &guard, deadline });
+    defer {
+        finishTimedCloseGuard(&guard);
+        timer.join();
+        closeTimedCloseGuardIfOpen(&guard);
+    }
 
     while (true) {
-        const now = std.time.milliTimestamp();
-        if (now >= deadline) {
-            try output.printError("exec timed out");
-            return 124;
-        }
-        const frame = try waitForStreamFrame(allocator, &stream, deadline - now);
-        switch (frame) {
-            .stdout => |bytes| {
-                defer allocator.free(bytes);
-                try std.io.getStdOut().writer().writeAll(bytes);
+        const frame = ipc.readFrameFile(allocator, &reply, 1024 * 1024) catch |err| switch (err) {
+            error.EndOfStream => null,
+            else => if (timedCloseGuardIsClosed(&guard)) null else return err,
+        } orelse {
+            if (timedCloseGuardIsClosed(&guard)) {
+                try output.printError("exec timed out");
+                return 124;
+            }
+            try output.printError("shell stopped");
+            return 1;
+        };
+        switch (frame.kind) {
+            .stdout => {
+                defer allocator.free(frame.payload);
+                try std.io.getStdOut().writer().writeAll(frame.payload);
             },
-            .stderr => |bytes| {
-                defer allocator.free(bytes);
-                try std.io.getStdErr().writer().writeAll(bytes);
+            .stderr => {
+                defer allocator.free(frame.payload);
+                try std.io.getStdErr().writer().writeAll(frame.payload);
             },
-            .complete => |completion| {
+            .complete => {
+                defer allocator.free(frame.payload);
+                const completion = try ipc.decodeCompletion(frame.payload);
                 if (completion.timed_out) {
                     try output.printError("exec timed out");
                     return 124;
                 }
                 return @intCast(@min(@max(completion.exit_code, 0), 255));
             },
-            .err => |message| {
-                defer allocator.free(message);
-                try output.printError(message);
+            .err => {
+                defer allocator.free(frame.payload);
+                try output.printError(frame.payload);
                 return 1;
             },
-            .stopped, .closed => {
+            .stopped => {
+                allocator.free(frame.payload);
                 try output.printError("shell stopped");
                 return 1;
             },
-            .timeout => {
-                try output.printError("exec timed out");
-                return 124;
+            .ready, .exec, .stop => {
+                allocator.free(frame.payload);
+                try output.printError("shell stopped");
+                return 1;
             },
         }
     }
@@ -311,6 +425,77 @@ fn spawnBroker(allocator: std.mem.Allocator, root: []const u8, id: []const u8, c
     return process.pidFromChildId(child.id);
 }
 
+const TimedCloseGuard = struct {
+    file: *std.fs.File,
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    done: bool = false,
+    closed: bool = false,
+};
+
+fn timedCloseGuardIsClosed(guard: *TimedCloseGuard) bool {
+    guard.mutex.lock();
+    defer guard.mutex.unlock();
+    return guard.closed;
+}
+
+fn deadlineCloser(guard: *TimedCloseGuard, deadline_ms: i64) void {
+    guard.mutex.lock();
+    while (!guard.done) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline_ms) break;
+        const timeout_ns: u64 = @intCast((deadline_ms - now) * std.time.ns_per_ms);
+        guard.cond.timedWait(&guard.mutex, timeout_ns) catch |err| switch (err) {
+            error.Timeout => break,
+        };
+    }
+
+    const should_close = !guard.done and !guard.closed;
+    if (should_close) guard.closed = true;
+    guard.mutex.unlock();
+    if (should_close) guard.file.close();
+}
+
+fn finishTimedCloseGuard(guard: *TimedCloseGuard) void {
+    guard.mutex.lock();
+    guard.done = true;
+    guard.cond.signal();
+    guard.mutex.unlock();
+}
+
+fn closeTimedCloseGuardIfOpen(guard: *TimedCloseGuard) void {
+    guard.mutex.lock();
+    const should_close = !guard.closed;
+    guard.closed = true;
+    guard.mutex.unlock();
+    if (should_close) guard.file.close();
+}
+
+fn waitForStartupFrame(allocator: std.mem.Allocator, file: *std.fs.File, timeout_ms: i64) !StartupWaitResult {
+    var guard = TimedCloseGuard{ .file = file };
+    var timer = try std.Thread.spawn(.{}, deadlineCloser, .{ &guard, std.time.milliTimestamp() + timeout_ms });
+    defer {
+        finishTimedCloseGuard(&guard);
+        timer.join();
+        closeTimedCloseGuardIfOpen(&guard);
+    }
+
+    const frame = ipc.readFrameFile(allocator, file, 4096) catch |err| {
+        if (timedCloseGuardIsClosed(&guard)) return .closed;
+        switch (err) {
+            error.EndOfStream => return .closed,
+            else => return err,
+        }
+    } orelse return .closed;
+    defer allocator.free(frame.payload);
+
+    switch (frame.kind) {
+        .ready => return .ready,
+        .err => return .{ .err = try allocator.dupe(u8, frame.payload) },
+        else => return .closed,
+    }
+}
+
 fn runStartWindows(allocator: std.mem.Allocator, options: cli.StartOptions) !u8 {
     const root = try state_dir.ensureLayout(allocator);
     defer allocator.free(root);
@@ -356,8 +541,12 @@ fn runStartWindows(allocator: std.mem.Allocator, options: cli.StartOptions) !u8 
 }
 
 fn runStopWindows(allocator: std.mem.Allocator, id: []const u8) !u8 {
-    const root = try state_dir.ensureLayout(allocator);
+    const root = try state_dir.appDataDir(allocator);
     defer allocator.free(root);
+    if (!try state_dir.existsPath(root)) {
+        try output.printError("shell not found");
+        return 1;
+    }
 
     try registry.revalidateAndPrune(allocator, root);
     const maybe_record = try registry.readOne(allocator, root, id);
@@ -389,8 +578,12 @@ fn runStopWindows(allocator: std.mem.Allocator, id: []const u8) !u8 {
 }
 
 fn runExecWindows(allocator: std.mem.Allocator, options: cli.ExecOptions) !u8 {
-    const root = try state_dir.ensureLayout(allocator);
+    const root = try state_dir.appDataDir(allocator);
     defer allocator.free(root);
+    if (!try state_dir.existsPath(root)) {
+        try output.printError("shell not found");
+        return 1;
+    }
     try registry.revalidateAndPrune(allocator, root);
 
     const maybe_record = try registry.readOne(allocator, root, options.id);

@@ -42,7 +42,13 @@ pub fn build(b: *std.Build) void {
     const run_integration_tests = b.addRunArtifact(integration_tests);
     run_integration_tests.step.dependOn(b.getInstallStep());
     run_integration_tests.setEnvironmentVariable("SHLICE_TEST_EXE", b.getInstallPath(.bin, bin_name));
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
-    test_step.dependOn(&run_integration_tests.step);
+    const unit_test_step = b.step("test-unit", "Run unit tests");
+    unit_test_step.dependOn(&run_unit_tests.step);
+
+    const integration_test_step = b.step("test-integration", "Run integration tests");
+    integration_test_step.dependOn(&run_integration_tests.step);
+
+    const test_step = b.step("test", "Run unit and integration tests");
+    test_step.dependOn(unit_test_step);
+    test_step.dependOn(integration_test_step);
 }

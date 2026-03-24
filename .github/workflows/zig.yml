@@ -73,9 +73,42 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $PWD ($archive -replace '\.zip$', ''))
       - name: Compile tests
         run: zig build test-compile -Dtarget=${{ matrix.target }}
-      - name: Run tests
+      - name: Build test binary
         if: matrix.run_tests
-        run: zig build test -Dtarget=${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }}
+      - name: Run unit tests
+        if: matrix.run_tests
+        run: zig test src/main.zig -Dtarget=${{ matrix.target }}
+      - name: Run integration tests (start)
+        if: matrix.run_tests
+        env:
+          SHLICE_TEST_EXE: ${{ matrix.target == 'x86_64-windows' && 'zig-out/bin/shlice.exe' || 'zig-out/bin/shlice' }}
+        run: zig test src/integration_test.zig -Dtarget=${{ matrix.target }} --test-filter "start osc repl, exec twice, stop"
+      - name: Run integration tests (timeout)
+        if: matrix.run_tests
+        env:
+          SHLICE_TEST_EXE: ${{ matrix.target == 'x86_64-windows' && 'zig-out/bin/shlice.exe' || 'zig-out/bin/shlice' }}
+        run: zig test src/integration_test.zig -Dtarget=${{ matrix.target }} --test-filter "exec incomplete command times out and shell recovers"
+      - name: Run integration tests (serialized)
+        if: matrix.run_tests
+        env:
+          SHLICE_TEST_EXE: ${{ matrix.target == 'x86_64-windows' && 'zig-out/bin/shlice.exe' || 'zig-out/bin/shlice' }}
+        run: zig test src/integration_test.zig -Dtarget=${{ matrix.target }} --test-filter "exec requests are serialized"
+      - name: Run integration tests (contention)
+        if: matrix.run_tests
+        env:
+          SHLICE_TEST_EXE: ${{ matrix.target == 'x86_64-windows' && 'zig-out/bin/shlice.exe' || 'zig-out/bin/shlice' }}
+        run: zig test src/integration_test.zig -Dtarget=${{ matrix.target }} --test-filter "exec requests stay serialized under contention"
+      - name: Run integration tests (stop)
+        if: matrix.run_tests
+        env:
+          SHLICE_TEST_EXE: ${{ matrix.target == 'x86_64-windows' && 'zig-out/bin/shlice.exe' || 'zig-out/bin/shlice' }}
+        run: zig test src/integration_test.zig -Dtarget=${{ matrix.target }} --test-filter "stop rejects queued exec"
+      - name: Run integration tests (missing shell)
+        if: matrix.run_tests
+        env:
+          SHLICE_TEST_EXE: ${{ matrix.target == 'x86_64-windows' && 'zig-out/bin/shlice.exe' || 'zig-out/bin/shlice' }}
+        run: zig test src/integration_test.zig -Dtarget=${{ matrix.target }} --test-filter "start fails fast on missing shell command"
       - name: Build release binary
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSmall
       - name: Upload release binary

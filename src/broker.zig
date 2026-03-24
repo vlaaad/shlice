@@ -12,7 +12,7 @@ const completion_grace_ms: i64 = 100;
 const command_begin_timeout_ms: i64 = 1000;
 
 const PendingRequest = struct {
-    stream: std.net.Stream,
+    reply_id: []u8,
     command: []u8,
 };
 
@@ -27,8 +27,9 @@ const SharedState = struct {
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
     queue: std.ArrayList(PendingRequest),
-    active_stream: ?std.net.Stream = null,
-    stop_stream: ?std.net.Stream = null,
+    active_reply: ?std.fs.File = null,
+    active_reply_id: ?[]u8 = null,
+    stop_reply_id: ?[]u8 = null,
     shell_ready: bool = false,
     shell_exited: bool = false,
     shutdown_requested: bool = false,
@@ -45,12 +46,17 @@ pub fn run(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
     const shell_dir = try state_dir.ensureShellDir(allocator, options.root, options.id);
     defer allocator.free(shell_dir);
 
-    const control_path = try state_dir.ipcSocketPath(allocator, options.root, options.id, "control");
+    const control_path = try state_dir.ipcSocketPath(allocator, options.root, options.id, "control.fifo");
     defer allocator.free(control_path);
-    var control_server = try ipc.bindUnixServer(control_path);
-    errdefer control_server.deinit();
+    try ipc.createFifo(allocator, control_path);
+    var control_file = try ipc.openFifoReadWrite(control_path);
+    defer control_file.close();
 
-    const command = try resolveCommand(allocator, options.command);
+    const command = resolveCommand(allocator, options.command) catch |err| {
+        try notifyStartupError(options.ready_socket, @errorName(err));
+        try cleanup(allocator, options.root, options.id);
+        return 1;
+    };
     defer freeCommand(allocator, command);
 
     const command_line = try std.mem.join(allocator, " ", command);
@@ -73,7 +79,6 @@ pub fn run(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
 
     child.spawn() catch |err| {
         try notifyStartupError(options.ready_socket, @errorName(err));
-        control_server.deinit();
         try cleanup(allocator, options.root, options.id);
         return 1;
     };
@@ -106,29 +111,27 @@ pub fn run(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
     };
     defer {
         for (state.queue.items) |request| {
+            allocator.free(request.reply_id);
             allocator.free(request.command);
-            request.stream.close();
         }
         state.queue.deinit();
     }
 
     var stdout_thread = try std.Thread.spawn(.{}, pumpStdout, .{ &state, stdout_file });
     var stderr_thread = try std.Thread.spawn(.{}, pumpStderr, .{ &state, stderr_file });
-    var accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{ &state, &control_server });
+    var control_thread = try std.Thread.spawn(.{}, controlLoop, .{ &state, &control_file });
 
     const startup_ok = try waitForStartupReady(&state);
     if (!startup_ok) {
         try notifyStartupError(options.ready_socket, "shell start failed");
         try shutdownChildAndDrain(allocator, &state, &child, &stdin_file, true);
-        control_server.deinit();
-        accept_thread.join();
+        control_thread.join();
         stdout_thread.join();
         stderr_thread.join();
         try cleanup(allocator, options.root, options.id);
         return 1;
     }
 
-    try notifyStartupReady(options.ready_socket);
     try registry.upsert(allocator, options.root, .{
         .id = options.id,
         .status = .ready,
@@ -137,6 +140,7 @@ pub fn run(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
         .command_line = command_line,
         .cwd = options.cwd,
     });
+    try notifyStartupReady(options.ready_socket);
 
     while (true) {
         state.mutex.lock();
@@ -148,9 +152,22 @@ pub fn run(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
             state.mutex.unlock();
             break;
         }
-        if (state.active_stream == null and state.queue.items.len != 0) {
+        if (state.active_reply == null and state.queue.items.len != 0) {
             const request = state.queue.orderedRemove(0);
-            state.active_stream = request.stream;
+            const reply_path = requestReplyPath(allocator, state.root, state.id, request.reply_id) catch {
+                allocator.free(request.reply_id);
+                allocator.free(request.command);
+                state.mutex.unlock();
+                continue;
+            };
+            defer allocator.free(reply_path);
+            state.active_reply = ipc.openFifoReadWrite(reply_path) catch {
+                allocator.free(request.reply_id);
+                allocator.free(request.command);
+                state.mutex.unlock();
+                continue;
+            };
+            state.active_reply_id = request.reply_id;
             state.request_started_at_ms = std.time.milliTimestamp();
             state.saw_begin = false;
             state.saw_end = false;
@@ -162,27 +179,35 @@ pub fn run(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
             const exec_command = try protocol.buildExecCommand(allocator, request.command);
             defer allocator.free(exec_command);
             stdin_file.writeAll(exec_command) catch {
-                allocator.free(request.command);
                 state.mutex.lock();
+                const reply = state.active_reply;
+                state.active_reply = null;
+                const reply_id = state.active_reply_id;
+                state.active_reply_id = null;
                 state.shutdown_requested = true;
                 state.mutex.unlock();
+                if (reply) |owned| owned.close();
+                if (reply_id) |owned_id| allocator.free(owned_id);
+                allocator.free(request.command);
                 continue;
             };
             allocator.free(request.command);
             continue;
         }
 
-        if (state.active_stream != null) {
+        if (state.active_reply != null) {
             const now_ms = std.time.milliTimestamp();
             const finish_reason = requestFinishReason(&state, now_ms);
             if (finish_reason) |reason| {
-                const active_stream = state.active_stream.?;
+                const active_reply = state.active_reply.?;
                 const exit_code: i32 = state.active_exit_code orelse switch (reason) {
                     .complete => 0,
                     .incomplete_command => 1,
                     .shutdown => 1,
                 };
-                state.active_stream = null;
+                state.active_reply = null;
+                const active_reply_id = state.active_reply_id;
+                state.active_reply_id = null;
                 state.request_started_at_ms = null;
                 state.saw_begin = false;
                 state.saw_end = false;
@@ -190,7 +215,12 @@ pub fn run(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
                 state.active_exit_code = null;
                 state.cond.broadcast();
                 state.mutex.unlock();
-                finishRequest(allocator, active_stream, reason, exit_code) catch {};
+                if (active_reply_id) |reply_id| {
+                    finishRequest(allocator, state.root, state.id, reply_id, active_reply, reason, exit_code) catch {};
+                    allocator.free(reply_id);
+                } else {
+                    active_reply.close();
+                }
                 continue;
             }
 
@@ -211,8 +241,7 @@ pub fn run(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
     }
 
     try shutdownChildAndDrain(allocator, &state, &child, &stdin_file, false);
-    control_server.deinit();
-    accept_thread.join();
+    control_thread.join();
     stdout_thread.join();
     stderr_thread.join();
     try cleanup(allocator, options.root, options.id);
@@ -235,76 +264,73 @@ fn waitForStartupReady(state: *SharedState) !bool {
 }
 
 fn notifyStartupReady(path: []const u8) !void {
-    var stream = try ipc.connectUnixStream(path);
+    var stream = try ipc.openFifoReadWrite(path);
     defer stream.close();
-    try ipc.sendFrame(&stream, .ready, &.{});
+    try ipc.sendFrameFile(&stream, .ready, &.{});
 }
 
 fn notifyStartupError(path: []const u8, message: []const u8) !void {
-    var stream = ipc.connectUnixStream(path) catch return;
+    var stream = ipc.openFifoReadWrite(path) catch return;
     defer stream.close();
-        try ipc.sendFrame(&stream, .err, message);
+    try ipc.sendFrameFile(&stream, .err, message);
 }
 
-fn acceptLoop(state: *SharedState, server: *std.net.Server) void {
+fn controlLoop(state: *SharedState, file: *std.fs.File) void {
     while (true) {
-        const connection = server.accept() catch return;
-        var stream = connection.stream;
-        const frame = ipc.readFrame(state.allocator, &stream, 1024 * 1024) catch |err| switch (err) {
-            error.EndOfStream => {
-                stream.close();
-                continue;
-            },
-            else => {
-                stream.close();
-                continue;
-            },
-        } orelse {
-            stream.close();
-            continue;
-        };
+        const frame = ipc.readFrameFile(state.allocator, file, 1024 * 1024) catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => return,
+        } orelse return;
 
         switch (frame.kind) {
             .exec => {
                 if (frame.payload.len == 0) {
                     allocatorFreeFrame(state.allocator, frame);
-                    stream.close();
                     continue;
                 }
+                const request = protocol.parseRequest(state.allocator, frame.payload) catch {
+                    allocatorFreeFrame(state.allocator, frame);
+                    continue;
+                };
+                errdefer state.allocator.free(request.id);
+                defer state.allocator.free(request.command);
                 state.mutex.lock();
                 if (state.shutdown_requested) {
                     state.mutex.unlock();
+                    state.allocator.free(request.id);
                     allocatorFreeFrame(state.allocator, frame);
-                    stream.close();
                     continue;
                 }
-                const command = state.allocator.dupe(u8, frame.payload) catch {
+                const queued_command = state.allocator.dupe(u8, request.command) catch {
                     state.mutex.unlock();
+                    state.allocator.free(request.id);
                     allocatorFreeFrame(state.allocator, frame);
-                    stream.close();
                     continue;
                 };
-                state.queue.append(.{ .stream = stream, .command = command }) catch {
-                    state.allocator.free(command);
+                state.queue.append(.{ .reply_id = request.id, .command = queued_command }) catch {
                     state.mutex.unlock();
+                    state.allocator.free(request.id);
+                    state.allocator.free(queued_command);
                     allocatorFreeFrame(state.allocator, frame);
-                    stream.close();
                     continue;
                 };
                 state.cond.broadcast();
                 state.mutex.unlock();
             },
             .stop => {
+                const request = protocol.parseRequest(state.allocator, frame.payload) catch {
+                    allocatorFreeFrame(state.allocator, frame);
+                    continue;
+                };
                 state.mutex.lock();
                 state.shutdown_requested = true;
-                if (state.stop_stream) |old| old.close();
-                state.stop_stream = stream;
+                if (state.stop_reply_id) |old| state.allocator.free(old);
+                state.stop_reply_id = request.id;
                 state.cond.broadcast();
                 state.mutex.unlock();
+                state.allocator.free(request.command);
             },
-            else => {
-                stream.close();
-            },
+            else => {},
         }
         allocatorFreeFrame(state.allocator, frame);
     }
@@ -370,9 +396,9 @@ const StdoutSink = struct {
 fn sendToActive(state: *SharedState, kind: ipc.FrameKind, bytes: []const u8) void {
     state.mutex.lock();
     defer state.mutex.unlock();
-    if (state.active_stream) |stream| {
-        var owned = stream;
-        ipc.sendFrame(&owned, kind, bytes) catch {};
+    if (state.active_reply) |reply| {
+        var owned = reply;
+        ipc.sendFrameFile(&owned, kind, bytes) catch {};
     }
 }
 
@@ -408,7 +434,7 @@ fn requestFinishReason(state: *SharedState, now_ms: i64) ?RequestFinishReason {
     if (state.saw_end and state.completion_ready_at_ms != null and now_ms - state.completion_ready_at_ms.? >= completion_grace_ms) {
         return .complete;
     }
-    if (state.shell_exited and state.active_stream != null) return .shutdown;
+    if (state.shell_exited and state.active_reply != null) return .shutdown;
     return null;
 }
 
@@ -426,44 +452,96 @@ fn activeWaitTimeout(state: *SharedState, now_ms: i64) u64 {
     return 0;
 }
 
-fn finishRequest(allocator: std.mem.Allocator, stream: std.net.Stream, reason: RequestFinishReason, exit_code: i32) !void {
-    var owned = stream;
+fn requestReplyPath(allocator: std.mem.Allocator, root: []const u8, id: []const u8, reply_id: []const u8) ![]u8 {
+    const filename = try std.fmt.allocPrint(allocator, "reply-{s}.fifo", .{reply_id});
+    defer allocator.free(filename);
+    return state_dir.shellFilePath(allocator, root, id, filename);
+}
+
+fn finishRequestFrames(allocator: std.mem.Allocator, reply_file: *std.fs.File, reason: RequestFinishReason, exit_code: i32) !void {
     switch (reason) {
         .complete => {
             const completion_bytes = try ipc.encodeCompletion(allocator, .{ .exit_code = exit_code, .timed_out = false });
             defer allocator.free(completion_bytes);
-            try ipc.sendFrame(&owned, .complete, completion_bytes);
+            try ipc.sendFrameFile(reply_file, .complete, completion_bytes);
         },
         .incomplete_command => {
-            try ipc.sendFrame(&owned, .stderr, "error: incomplete command\n");
+            try ipc.sendFrameFile(reply_file, .stderr, "error: incomplete command\n");
             const completion_bytes = try ipc.encodeCompletion(allocator, .{ .exit_code = 1, .timed_out = false });
             defer allocator.free(completion_bytes);
-            try ipc.sendFrame(&owned, .complete, completion_bytes);
+            try ipc.sendFrameFile(reply_file, .complete, completion_bytes);
         },
         .shutdown => {
-            try ipc.sendFrame(&owned, .stderr, "error: shell stopped\n");
+            try ipc.sendFrameFile(reply_file, .stderr, "error: shell stopped\n");
             const completion_bytes = try ipc.encodeCompletion(allocator, .{ .exit_code = exit_code, .timed_out = false });
             defer allocator.free(completion_bytes);
-            try ipc.sendFrame(&owned, .complete, completion_bytes);
+            try ipc.sendFrameFile(reply_file, .complete, completion_bytes);
         },
     }
-    owned.close();
+}
+
+fn finishRequest(allocator: std.mem.Allocator, root: []const u8, id: []const u8, reply_id: []const u8, reply_file: std.fs.File, reason: RequestFinishReason, exit_code: i32) !void {
+    var owned = reply_file;
+    defer owned.close();
+    const reply_path = try requestReplyPath(allocator, root, id, reply_id);
+    defer allocator.free(reply_path);
+    finishRequestFrames(allocator, &owned, reason, exit_code) catch {};
+    std.fs.deleteFileAbsolute(reply_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn finishQueuedRequest(allocator: std.mem.Allocator, root: []const u8, id: []const u8, reply_id: []const u8, reason: RequestFinishReason, exit_code: i32) !void {
+    const reply_path = requestReplyPath(allocator, root, id, reply_id) catch return;
+    defer allocator.free(reply_path);
+
+    var reply_file = ipc.openFifoReadWrite(reply_path) catch {
+        std.fs.deleteFileAbsolute(reply_path) catch {};
+        return;
+    };
+    defer reply_file.close();
+
+    finishRequestFrames(allocator, &reply_file, reason, exit_code) catch {};
+    std.fs.deleteFileAbsolute(reply_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn finishStoppedReply(allocator: std.mem.Allocator, root: []const u8, id: []const u8, reply_id: []const u8) !void {
+    const reply_path = requestReplyPath(allocator, root, id, reply_id) catch return;
+    defer allocator.free(reply_path);
+
+    var reply_file = ipc.openFifoReadWrite(reply_path) catch {
+        std.fs.deleteFileAbsolute(reply_path) catch {};
+        return;
+    };
+    defer reply_file.close();
+
+    ipc.sendFrameFile(&reply_file, .stopped, &.{}) catch {};
+    std.fs.deleteFileAbsolute(reply_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn shutdownChildAndDrain(allocator: std.mem.Allocator, state: *SharedState, child: *std.process.Child, stdin_file: *std.fs.File, force: bool) !void {
     _ = force;
     state.mutex.lock();
     state.shutdown_requested = true;
-    const active_stream = state.active_stream;
-    state.active_stream = null;
+    const active_reply = state.active_reply;
+    state.active_reply = null;
+    const active_reply_id = state.active_reply_id;
+    state.active_reply_id = null;
     const active_exit_code = state.active_exit_code orelse 1;
     const queued = state.queue.toOwnedSlice() catch {
         state.mutex.unlock();
         return;
     };
     state.queue = std.ArrayList(PendingRequest).init(state.allocator);
-    const stop_stream = state.stop_stream;
-    state.stop_stream = null;
+    const stop_reply_id = state.stop_reply_id;
+    state.stop_reply_id = null;
     state.mutex.unlock();
 
     stdin_file.close();
@@ -474,17 +552,23 @@ fn shutdownChildAndDrain(allocator: std.mem.Allocator, state: *SharedState, chil
         _ = child.wait() catch {};
     }
 
-    if (active_stream) |stream| {
-        finishRequest(allocator, stream, .shutdown, active_exit_code) catch {};
+    if (active_reply) |reply| {
+        if (active_reply_id) |reply_id| {
+            finishRequest(allocator, state.root, state.id, reply_id, reply, .shutdown, active_exit_code) catch {};
+            allocator.free(reply_id);
+        } else {
+            var owned = reply;
+            owned.close();
+        }
     }
     for (queued) |request| {
-        finishRequest(allocator, request.stream, .shutdown, 1) catch {};
+        finishQueuedRequest(allocator, state.root, state.id, request.reply_id, .shutdown, 1) catch {};
+        allocator.free(request.reply_id);
         allocator.free(request.command);
     }
-    if (stop_stream) |stream| {
-        var owned = stream;
-        ipc.sendFrame(&owned, .stopped, &.{}) catch {};
-        owned.close();
+    if (stop_reply_id) |reply_id| {
+        finishStoppedReply(allocator, state.root, state.id, reply_id) catch {};
+        allocator.free(reply_id);
     }
     allocator.free(queued);
 }
@@ -566,7 +650,7 @@ const WindowsSharedState = struct {
     cwd: []const u8,
     shell_pid: u32,
     mutex: std.Thread.Mutex = .{},
-    active_request_id: ?[]const u8 = null,
+    active_request_id: ?[]u8 = null,
     active_stdout: ?std.fs.File = null,
     active_stderr: ?std.fs.File = null,
     active_exit_code: ?i32 = null,
@@ -581,7 +665,11 @@ fn runWindows(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
     const shell_dir = try state_dir.ensureShellDir(allocator, options.root, options.id);
     defer allocator.free(shell_dir);
 
-    const command = try resolveCommand(allocator, options.command);
+    const command = resolveCommand(allocator, options.command) catch |err| {
+        try writeErrorFile(allocator, options.root, options.id, @errorName(err));
+        try cleanup(allocator, options.root, options.id);
+        return 1;
+    };
     defer freeCommand(allocator, command);
 
     const command_line = try std.mem.join(allocator, " ", command);
@@ -786,7 +874,7 @@ fn windowsMaybeStartRequest(allocator: std.mem.Allocator, state: *WindowsSharedS
 
     state.mutex.lock();
     defer state.mutex.unlock();
-    state.active_request_id = @constCast(request.id);
+    state.active_request_id = request.id;
     state.active_stdout = stdout_log;
     state.active_stderr = stderr_log;
     state.active_exit_code = null;
@@ -805,7 +893,7 @@ fn windowsMaybeStartRequest(allocator: std.mem.Allocator, state: *WindowsSharedS
 }
 
 fn windowsMaybeFinalizeRequest(allocator: std.mem.Allocator, state: *WindowsSharedState) !void {
-    var request_id: ?[]const u8 = null;
+    var request_id: ?[]u8 = null;
     var stdout_log: ?std.fs.File = null;
     var stderr_log: ?std.fs.File = null;
     var exit_code: i32 = 1;
