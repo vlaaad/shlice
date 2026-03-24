@@ -250,6 +250,111 @@ test "exec requests are serialized" {
     try std.testing.expect(second_result.duration_ms >= first_result.duration_ms - 150);
 }
 
+test "exec requests stay serialized under contention" {
+    const allocator = std.testing.allocator;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const shlice_exe = try findShliceExe(allocator);
+    defer allocator.free(shlice_exe);
+
+    const clj_exe = try process.resolveExecutable(allocator, "clj");
+    defer allocator.free(clj_exe);
+    const clojure_exe = process.resolveExecutable(allocator, "clojure") catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (clojure_exe) |path| allocator.free(path);
+
+    const workspace_root = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_root);
+
+    const osc_repl = "osc-repl.clj";
+
+    const sandbox = try createSandbox(allocator, workspace_root);
+    defer sandbox.deinit();
+
+    var env = try std.process.getEnvMap(allocator);
+    defer env.deinit();
+
+    try configureEnv(&env, sandbox.root, sandbox.home);
+
+    const shell_id = "osc-repl-hammer-test";
+
+    var stop_needed = false;
+    defer if (stop_needed) {
+        if (runCommand(allocator, &env, workspace_root, &.{ shlice_exe, "stop", shell_id })) |stop_result| {
+            defer stop_result.deinit(allocator);
+        } else |_| {}
+    };
+
+    const start_result = try startRepl(allocator, &env, workspace_root, shlice_exe, shell_id, osc_repl, clj_exe, clojure_exe);
+    defer start_result.deinit(allocator);
+    try expectExitCode(start_result.term, 0, start_result.stdout, start_result.stderr);
+    stop_needed = true;
+
+    const thread_count = 8;
+    const sleep_ms = 200;
+    var gate = StartGate{ .total = thread_count };
+    var runs: [thread_count]HammerRun = undefined;
+    var threads: [thread_count]std.Thread = undefined;
+    var commands: [thread_count][]u8 = undefined;
+    var commands_allocated: usize = 0;
+
+    defer for (commands[0..commands_allocated]) |command| allocator.free(command);
+
+    for (0..thread_count) |i| {
+        commands[i] = try std.fmt.allocPrint(
+            allocator,
+            "(do (println \"thread-{d}\") (Thread/sleep {d}) :thread-{d})",
+            .{ i, sleep_ms, i },
+        );
+        commands_allocated += 1;
+        runs[i] = .{
+            .env = &env,
+            .cwd = workspace_root,
+            .shlice_exe = shlice_exe,
+            .shell_id = shell_id,
+            .command = commands[i],
+            .gate = &gate,
+        };
+    }
+
+    for (0..thread_count) |i| {
+        threads[i] = try std.Thread.spawn(.{}, HammerRun.run, .{ &runs[i] });
+    }
+
+    for (0..thread_count) |i| {
+        threads[i].join();
+    }
+
+    var min_duration: i64 = std.math.maxInt(i64);
+    var max_duration: i64 = std.math.minInt(i64);
+    for (runs, 0..) |run, i| {
+        try std.testing.expect(run.err == null);
+        const result = run.result orelse return error.TestExpectedEqual;
+        defer result.result.deinit(std.heap.page_allocator);
+        try expectExitCode(result.result.term, 0, result.result.stdout, result.result.stderr);
+
+        const stdout = try normalizeNewlinesOwned(allocator, result.result.stdout);
+        defer allocator.free(stdout);
+        const stderr = try normalizeNewlinesOwned(allocator, result.result.stderr);
+        defer allocator.free(stderr);
+
+        var tag_buf: [32]u8 = undefined;
+        const tag = try std.fmt.bufPrint(&tag_buf, "thread-{d}", .{i});
+        const expected_stdout = try std.fmt.allocPrint(allocator, "{s}\n:{s}\n", .{ tag, tag });
+        defer allocator.free(expected_stdout);
+        try std.testing.expectEqualStrings(expected_stdout, stdout);
+        try std.testing.expectEqualStrings("", stderr);
+
+        const duration = run.duration_ms.?;
+        if (duration < min_duration) min_duration = duration;
+        if (duration > max_duration) max_duration = duration;
+    }
+
+    try std.testing.expect(max_duration - min_duration >= @as(i64, (thread_count - 1) * sleep_ms - 250));
+}
+
 test "stop rejects queued exec" {
     const allocator = std.testing.allocator;
     if (builtin.os.tag == .windows) return error.SkipZigTest;
@@ -452,6 +557,55 @@ const AsyncRun = struct {
             .result = command_result,
             .duration_ms = std.time.milliTimestamp() - start,
         };
+    }
+};
+
+const StartGate = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    total: usize,
+    arrived: usize = 0,
+    released: bool = false,
+
+    fn wait(self: *StartGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.arrived += 1;
+        if (self.arrived == self.total) {
+            self.released = true;
+            self.cond.broadcast();
+            return;
+        }
+        while (!self.released) {
+            self.cond.wait(&self.mutex);
+        }
+    }
+};
+
+const HammerRun = struct {
+    env: *const std.process.EnvMap,
+    cwd: []const u8,
+    shlice_exe: []const u8,
+    shell_id: []const u8,
+    command: []const u8,
+    gate: *StartGate,
+    result: ?TimedCommandResult = null,
+    duration_ms: ?i64 = null,
+    err: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        self.gate.wait();
+        const start = std.time.milliTimestamp();
+        const argv = &.{ self.shlice_exe, "exec", "--id", self.shell_id, self.command };
+        const command_result = runCommand(std.heap.page_allocator, self.env, self.cwd, argv) catch |err| {
+            self.err = err;
+            return;
+        };
+        self.result = .{
+            .result = command_result,
+            .duration_ms = std.time.milliTimestamp() - start,
+        };
+        self.duration_ms = self.result.?.duration_ms;
     }
 };
 
