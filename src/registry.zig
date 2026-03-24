@@ -15,7 +15,6 @@ pub const ShellRecord = struct {
     pid: ?u32,
     broker_pid: ?u32 = null,
     command_line: []const u8,
-    cwd: []const u8,
 };
 
 pub fn entryPath(allocator: std.mem.Allocator, root: []const u8, id: []const u8) ![]u8 {
@@ -101,7 +100,6 @@ pub fn listAll(allocator: std.mem.Allocator, root: []const u8) ![]ShellRecord {
 pub fn freeRecord(allocator: std.mem.Allocator, record: ShellRecord) void {
     allocator.free(record.id);
     allocator.free(record.command_line);
-    allocator.free(record.cwd);
 }
 
 pub fn freeRecords(allocator: std.mem.Allocator, records: []ShellRecord) void {
@@ -163,16 +161,12 @@ fn cloneRecord(allocator: std.mem.Allocator, record: ShellRecord) !ShellRecord {
 
     const command_line = try allocator.dupe(u8, record.command_line);
     errdefer allocator.free(command_line);
-
-    const cwd = try allocator.dupe(u8, record.cwd);
-    errdefer allocator.free(cwd);
     return .{
         .id = id,
         .status = record.status,
         .pid = record.pid,
         .broker_pid = record.broker_pid,
         .command_line = command_line,
-        .cwd = cwd,
     };
 }
 
@@ -199,7 +193,6 @@ test "status stringifies via json" {
         .pid = 42,
         .broker_pid = 7,
         .command_line = "sh",
-        .cwd = "/tmp",
     }, .{});
     defer std.testing.allocator.free(payload);
     try std.testing.expect(std.mem.indexOf(u8, payload, "ready") != null);
@@ -226,7 +219,6 @@ test "registry upsert read and list are stable" {
         .pid = null,
         .broker_pid = null,
         .command_line = "bash",
-        .cwd = "/workspace",
     });
     try upsert(std.testing.allocator, root, .{
         .id = "alpha",
@@ -234,7 +226,6 @@ test "registry upsert read and list are stable" {
         .pid = process.currentPid(),
         .broker_pid = process.currentPid(),
         .command_line = "zsh",
-        .cwd = "/tmp",
     });
 
     const single = (try readOne(std.testing.allocator, root, "beta")).?;
@@ -271,7 +262,6 @@ test "revalidate prunes dead broker state" {
         .pid = 999999,
         .broker_pid = 999999,
         .command_line = "sh",
-        .cwd = "/tmp",
     });
 
     try revalidateAndPrune(std.testing.allocator, root);

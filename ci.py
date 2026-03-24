@@ -18,6 +18,10 @@ POLL_TIMEOUT_SECONDS = 180
 WATCH_TIMEOUT_SECONDS = 900
 WATCH_STALE_WARN_SECONDS = 180
 
+if os.name == "nt":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 
 def run(
     *args: str, env: dict[str, str] | None = None, check: bool = True
@@ -268,16 +272,20 @@ def main() -> int:
         ).stdout.strip()
         print(f"result: {conclusion}", flush=True)
         if watch == 0:
+            download_dir = DIST
             try:
                 if DIST.exists():
                     shutil.rmtree(DIST, ignore_errors=False)
                 DIST.mkdir(exist_ok=True)
             except PermissionError as exc:
-                raise RuntimeError(
-                    f"could not clear {DIST}; a file is likely still in use. stop any running shlice processes launched from dist/ and retry"
-                ) from exc
-            print(f"downloading artifacts to {DIST}...", flush=True)
-            run("gh", "run", "download", str(run_id), "--dir", str(DIST))
+                download_dir = Path(tempfile.mkdtemp(prefix="ci-artifacts-"))
+                print(
+                    f"warning: could not clear {DIST}; downloading artifacts to {download_dir} instead",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            print(f"downloading artifacts to {download_dir}...", flush=True)
+            run("gh", "run", "download", str(run_id), "--dir", str(download_dir))
         return watch
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)

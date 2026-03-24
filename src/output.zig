@@ -30,25 +30,25 @@ pub fn printError(message: []const u8) !void {
 }
 
 pub fn printStatusHeader(writer: anytype) !void {
-    try writer.writeAll("id\tstatus\tpid\tbroker\tcmd\tcwd\n");
+    try writer.writeAll("id\tstatus\tpid\tbroker\tcmd\n");
 }
 
 pub fn printNoShells(writer: anytype) !void {
     try writer.writeAll("no shells\n");
 }
 
-pub fn printStatusLine(writer: anytype, id: []const u8, status: []const u8, pid: ?u32, broker_pid: ?u32, command_line: []const u8, cwd: []const u8) !void {
+pub fn printStatusLine(writer: anytype, id: []const u8, status: []const u8, pid: ?u32, broker_pid: ?u32, command_line: []const u8) !void {
     if (pid) |live_pid| {
         if (broker_pid) |live_broker_pid| {
-            try writer.print("{s}\t{s}\t{d}\t{d}\t{s}\t{s}\n", .{ id, status, live_pid, live_broker_pid, command_line, cwd });
+            try writer.print("{s}\t{s}\t{d}\t{d}\t{s}\n", .{ id, status, live_pid, live_broker_pid, command_line });
         } else {
-            try writer.print("{s}\t{s}\t{d}\t-\t{s}\t{s}\n", .{ id, status, live_pid, command_line, cwd });
+            try writer.print("{s}\t{s}\t{d}\t-\t{s}\n", .{ id, status, live_pid, command_line });
         }
     } else {
         if (broker_pid) |live_broker_pid| {
-            try writer.print("{s}\t{s}\t-\t{d}\t{s}\t{s}\n", .{ id, status, live_broker_pid, command_line, cwd });
+            try writer.print("{s}\t{s}\t-\t{d}\t{s}\n", .{ id, status, live_broker_pid, command_line });
         } else {
-            try writer.print("{s}\t{s}\t-\t-\t{s}\t{s}\n", .{ id, status, command_line, cwd });
+            try writer.print("{s}\t{s}\t-\t-\t{s}\n", .{ id, status, command_line });
         }
     }
 }

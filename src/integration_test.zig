@@ -212,20 +212,25 @@ test "exec requests are serialized" {
     stop_needed = true;
 
     std.debug.print("phase: first exec\n", .{});
-    const first_argv = &.{
-        shlice_exe,
-        "exec",
-        "--id",
-        shell_id,
-        "(do (println \"one\") (Thread/sleep 600) :first)",
-    };
-    const second_argv = &.{
-        shlice_exe,
-        "exec",
-        "--id",
-        shell_id,
-        "(do (println \"two\") :second)",
-    };
+    const marker_path = try std.fs.path.join(allocator, &.{ sandbox.root, "serialized-marker.txt" });
+    defer allocator.free(marker_path);
+
+    const first_command = try std.fmt.allocPrint(
+        allocator,
+        "(do (println \"one\") (spit \"{s}\" \"running\") (Thread/sleep 1000) (.delete (java.io.File. \"{s}\")) :first)",
+        .{ marker_path, marker_path },
+    );
+    defer allocator.free(first_command);
+
+    const second_command = try std.fmt.allocPrint(
+        allocator,
+        "(do (println \"two\") (println (if (.exists (java.io.File. \"{s}\")) \"busy\" \"clear\")) :second)",
+        .{ marker_path },
+    );
+    defer allocator.free(second_command);
+
+    const first_argv = &.{ shlice_exe, "exec", "--id", shell_id, first_command };
+    const second_argv = &.{ shlice_exe, "exec", "--id", shell_id, second_command };
 
     std.debug.print("phase: second exec\n", .{});
     var first_ctx = AsyncRun{ .env = &env, .cwd = workspace_root, .argv = first_argv };
@@ -252,11 +257,7 @@ test "exec requests are serialized" {
     const second_stdout = try normalizeNewlinesOwned(allocator, second_result.result.stdout);
     defer allocator.free(second_stdout);
     try std.testing.expectEqualStrings("one\n:first\n", first_stdout);
-    try std.testing.expectEqualStrings("two\n:second\n", second_stdout);
-
-    try std.testing.expect(first_result.duration_ms >= 500);
-    try std.testing.expect(second_result.duration_ms >= 500);
-    try std.testing.expect(second_result.duration_ms >= first_result.duration_ms - 150);
+    try std.testing.expectEqualStrings("two\nclear\n:second\n", second_stdout);
 }
 
 test "exec requests stay serialized under contention" {

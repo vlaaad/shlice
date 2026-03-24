@@ -8,7 +8,17 @@ const protocol = @import("protocol.zig");
 const registry = @import("registry.zig");
 const state_dir = @import("state_dir.zig");
 
-const completion_grace_ms: i64 = 100;
+const windows = std.os.windows;
+const windows_create_no_window: windows.DWORD = 0x08000000;
+const windows_detached_process: windows.DWORD = 0x00000008;
+const windows_new_process_group: windows.DWORD = 0x00000200;
+const windows_detached_creation_flags: windows.DWORD =
+    windows.CREATE_UNICODE_ENVIRONMENT |
+    windows_create_no_window |
+    windows_detached_process |
+    windows_new_process_group;
+
+const completion_grace_ms: i64 = 10;
 const command_begin_timeout_ms: i64 = 1000;
 
 const PendingRequest = struct {
@@ -68,7 +78,6 @@ pub fn run(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
         .pid = null,
         .broker_pid = process.currentPid(),
         .command_line = command_line,
-        .cwd = options.cwd,
     });
 
     var child = std.process.Child.init(command, allocator);
@@ -89,7 +98,6 @@ pub fn run(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
         .pid = process.pidFromChildId(child.id),
         .broker_pid = process.currentPid(),
         .command_line = command_line,
-        .cwd = options.cwd,
     });
 
     var stdin_file = child.stdin.?;
@@ -138,7 +146,6 @@ pub fn run(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
         .pid = process.pidFromChildId(child.id),
         .broker_pid = process.currentPid(),
         .command_line = command_line,
-        .cwd = options.cwd,
     });
     try notifyStartupReady(options.ready_socket);
 
@@ -364,6 +371,8 @@ fn pumpStdout(state: *SharedState, file: std.fs.File) void {
         const parsed = protocol.parseStdoutChunk(stdoutSink(state), buffer[0..bytes_read], &parse_state) catch break;
         applyParsedStdout(state, parsed);
     }
+
+    protocol.flushStdoutChunk(stdoutSink(state), &parse_state) catch {};
 
     state.mutex.lock();
     state.shell_exited = true;
@@ -681,41 +690,29 @@ fn runWindows(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
         .pid = null,
         .broker_pid = process.currentPid(),
         .command_line = command_line,
-        .cwd = options.cwd,
     });
 
-    var child = std.process.Child.init(command, allocator);
-    child.cwd = options.cwd;
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    child.spawn() catch |err| {
+    const spawn = spawnWindowsProcess(allocator, command, options.cwd, .pipe, windows_detached_creation_flags) catch |err| {
         try writeErrorFile(allocator, options.root, options.id, @errorName(err));
         try cleanup(allocator, options.root, options.id);
         return 1;
     };
+    var stdin_file = spawn.stdin_file.?;
+    var stdout_file = spawn.stdout_file.?;
+    const stderr_file = spawn.stderr_file.?;
 
     try registry.upsert(allocator, options.root, .{
         .id = options.id,
         .status = .busy,
-        .pid = process.pidFromChildId(child.id),
+        .pid = spawn.pid,
         .broker_pid = process.currentPid(),
         .command_line = command_line,
-        .cwd = options.cwd,
     });
 
-    var stdin_file = child.stdin.?;
-    child.stdin = null;
-    var stdout_file = child.stdout.?;
-    child.stdout = null;
-    const stderr_file = child.stderr.?;
-    child.stderr = null;
-
     if (!try windowsWaitForReady(allocator, &stdout_file)) {
-        _ = process.forceKill(process.pidFromChildId(child.id));
-        _ = child.wait() catch {};
+        _ = process.forceKill(spawn.pid);
         stdin_file.close();
+        stdout_file.close();
         stderr_file.close();
         try writeErrorFile(allocator, options.root, options.id, "shell did not become ready before timeout");
         try cleanup(allocator, options.root, options.id);
@@ -728,7 +725,7 @@ fn runWindows(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
         .id = options.id,
         .command_line = command_line,
         .cwd = options.cwd,
-        .shell_pid = process.pidFromChildId(child.id),
+        .shell_pid = spawn.pid,
     };
     defer {
         if (state.active_request_id) |request_id| state.allocator.free(request_id);
@@ -743,10 +740,9 @@ fn runWindows(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
     try registry.upsert(allocator, options.root, .{
         .id = options.id,
         .status = .ready,
-        .pid = process.pidFromChildId(child.id),
+        .pid = spawn.pid,
         .broker_pid = process.currentPid(),
         .command_line = command_line,
-        .cwd = options.cwd,
     });
 
     const stop_path = try state_dir.shellFilePath(allocator, options.root, options.id, "stop.request");
@@ -757,17 +753,15 @@ fn runWindows(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
             state.mutex.lock();
             state.shutdown = true;
             state.mutex.unlock();
-            _ = process.terminate(process.pidFromChildId(child.id));
-            if (!process.waitUntilDead(process.pidFromChildId(child.id), 1500)) _ = process.forceKill(process.pidFromChildId(child.id));
-            _ = child.wait() catch {};
+            _ = process.terminate(spawn.pid);
+            if (!process.waitUntilDead(spawn.pid, 1500)) _ = process.forceKill(spawn.pid);
             break;
         }
 
-        if (!process.isAlive(process.pidFromChildId(child.id))) {
+        if (!process.isAlive(spawn.pid)) {
             state.mutex.lock();
             state.shutdown = true;
             state.mutex.unlock();
-            _ = child.wait() catch {};
             break;
         }
 
@@ -781,6 +775,294 @@ fn runWindows(allocator: std.mem.Allocator, options: cli.BrokerOptions) !u8 {
     stderr_thread.join();
     try cleanup(allocator, options.root, options.id);
     return 0;
+}
+
+const WindowsLaunchCommand = struct {
+    application_name: [:0]u16,
+    command_line: [:0]u16,
+};
+
+const WindowsSpawnMode = enum { ignore, pipe };
+
+const WindowsSpawnResult = struct {
+    pid: u32,
+    stdin_file: ?std.fs.File = null,
+    stdout_file: ?std.fs.File = null,
+    stderr_file: ?std.fs.File = null,
+};
+
+fn spawnWindowsProcess(allocator: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8, mode: WindowsSpawnMode, creation_flags: windows.DWORD) !WindowsSpawnResult {
+    if (argv.len == 0) return error.InvalidArguments;
+
+    var sa = windows.SECURITY_ATTRIBUTES{
+        .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
+        .bInheritHandle = windows.TRUE,
+        .lpSecurityDescriptor = null,
+    };
+
+    var nul_handle: ?windows.HANDLE = null;
+    if (mode == .ignore) {
+        nul_handle = try openWindowsNullHandle(&sa);
+    }
+    defer if (nul_handle) |handle| std.posix.close(handle);
+
+    var child_stdin: ?windows.HANDLE = null;
+    var parent_stdin: ?windows.HANDLE = null;
+    var child_stdout: ?windows.HANDLE = null;
+    var parent_stdout: ?windows.HANDLE = null;
+    var child_stderr: ?windows.HANDLE = null;
+    var parent_stderr: ?windows.HANDLE = null;
+
+    switch (mode) {
+        .ignore => {
+            child_stdin = nul_handle;
+            child_stdout = nul_handle;
+            child_stderr = nul_handle;
+        },
+        .pipe => {
+            try windowsMakePipe(&child_stdin, &parent_stdin, &sa, true);
+            try windowsMakePipe(&child_stdout, &parent_stdout, &sa, false);
+            try windowsMakePipe(&child_stderr, &parent_stderr, &sa, false);
+        },
+    }
+    errdefer {
+        if (mode == .pipe) {
+            if (child_stdin) |handle| std.posix.close(handle);
+            if (parent_stdin) |handle| std.posix.close(handle);
+            if (child_stdout) |handle| std.posix.close(handle);
+            if (parent_stdout) |handle| std.posix.close(handle);
+            if (child_stderr) |handle| std.posix.close(handle);
+            if (parent_stderr) |handle| std.posix.close(handle);
+        }
+    }
+
+    var startup = windows.STARTUPINFOW{
+        .cb = @sizeOf(windows.STARTUPINFOW),
+        .hStdInput = child_stdin,
+        .hStdOutput = child_stdout,
+        .hStdError = child_stderr,
+        .dwFlags = windows.STARTF_USESTDHANDLES,
+        .lpReserved = null,
+        .lpDesktop = null,
+        .lpTitle = null,
+        .dwX = 0,
+        .dwY = 0,
+        .dwXSize = 0,
+        .dwYSize = 0,
+        .dwXCountChars = 0,
+        .dwYCountChars = 0,
+        .dwFillAttribute = 0,
+        .wShowWindow = 0,
+        .cbReserved2 = 0,
+        .lpReserved2 = null,
+    };
+    var process_info: windows.PROCESS_INFORMATION = undefined;
+
+    const launch = try buildWindowsLaunchCommand(allocator, argv);
+    defer allocator.free(launch.application_name);
+    defer allocator.free(launch.command_line);
+
+    const cwd_w = if (cwd) |value| try std.unicode.wtf8ToWtf16LeAllocZ(allocator, value) else null;
+    defer if (cwd_w) |value| allocator.free(value);
+
+    try windows.CreateProcessW(
+        launch.application_name.ptr,
+        launch.command_line.ptr,
+        null,
+        null,
+        windows.TRUE,
+        creation_flags,
+        null,
+        if (cwd_w) |value| value.ptr else null,
+        &startup,
+        &process_info,
+    );
+    if (mode == .pipe) {
+        if (child_stdin) |handle| std.posix.close(handle);
+        if (child_stdout) |handle| std.posix.close(handle);
+        if (child_stderr) |handle| std.posix.close(handle);
+    }
+    defer std.posix.close(process_info.hProcess);
+    defer std.posix.close(process_info.hThread);
+
+    return .{
+        .pid = process.pidFromChildId(process_info.hProcess),
+        .stdin_file = if (parent_stdin) |handle| .{ .handle = handle } else null,
+        .stdout_file = if (parent_stdout) |handle| .{ .handle = handle } else null,
+        .stderr_file = if (parent_stderr) |handle| .{ .handle = handle } else null,
+    };
+}
+
+fn buildWindowsLaunchCommand(allocator: std.mem.Allocator, argv: []const []const u8) !WindowsLaunchCommand {
+    const app_path = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, argv[0]);
+    errdefer allocator.free(app_path);
+
+    const ext = std.fs.path.extension(argv[0]);
+    if (std.ascii.eqlIgnoreCase(ext, ".bat") or std.ascii.eqlIgnoreCase(ext, ".cmd")) {
+        const application_name = try windowsCmdExePath(allocator);
+        errdefer allocator.free(application_name);
+        const command_line = try argvToScriptCommandLineWindows(allocator, app_path, argv[1..]);
+        return .{ .application_name = application_name, .command_line = command_line };
+    }
+
+    const command_line = try argvToCommandLineWindows(allocator, argv);
+    return .{ .application_name = app_path, .command_line = command_line };
+}
+
+fn openWindowsNullHandle(sa: *windows.SECURITY_ATTRIBUTES) !windows.HANDLE {
+    const nul_path = &[_]u16{ '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'N', 'u', 'l', 'l' };
+    return windows.OpenFile(nul_path, .{
+        .access_mask = windows.GENERIC_READ | windows.GENERIC_WRITE | windows.SYNCHRONIZE,
+        .share_access = windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+        .sa = sa,
+        .creation = windows.OPEN_EXISTING,
+    }) catch |err| switch (err) {
+        else => return err,
+    };
+}
+
+fn windowsMakePipe(child_end: *?windows.HANDLE, parent_end: *?windows.HANDLE, sa: *const windows.SECURITY_ATTRIBUTES, child_gets_read_end: bool) !void {
+    var read_handle: windows.HANDLE = undefined;
+    var write_handle: windows.HANDLE = undefined;
+    try windows.CreatePipe(&read_handle, &write_handle, sa);
+
+    const child_handle = if (child_gets_read_end) read_handle else write_handle;
+    const parent_handle = if (child_gets_read_end) write_handle else read_handle;
+    try windows.SetHandleInformation(parent_handle, windows.HANDLE_FLAG_INHERIT, 0);
+    child_end.* = child_handle;
+    parent_end.* = parent_handle;
+}
+
+fn windowsCmdExePath(allocator: std.mem.Allocator) ![:0]u16 {
+    var buf = try std.ArrayListUnmanaged(u16).initCapacity(allocator, 128);
+    errdefer buf.deinit(allocator);
+    while (true) {
+        const unused_slice = buf.unusedCapacitySlice();
+        const len = windows.kernel32.GetSystemDirectoryW(@ptrCast(unused_slice), @intCast(unused_slice.len));
+        if (len == 0) {
+            return windows.unexpectedError(windows.kernel32.GetLastError());
+        }
+        if (len > unused_slice.len) {
+            try buf.ensureUnusedCapacity(allocator, len);
+        } else {
+            buf.items.len = len;
+            break;
+        }
+    }
+    switch (buf.items[buf.items.len - 1]) {
+        '/', '\\' => {},
+        else => try buf.append(allocator, std.fs.path.sep),
+    }
+    try buf.appendSlice(allocator, std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe"));
+    return try buf.toOwnedSliceSentinel(allocator, 0);
+}
+
+fn argvToCommandLineWindows(allocator: std.mem.Allocator, argv: []const []const u8) ![:0]u16 {
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+
+    if (argv.len != 0) {
+        const arg0 = argv[0];
+        var needs_quotes = arg0.len == 0;
+        for (arg0) |c| {
+            if (c <= ' ') needs_quotes = true;
+            if (c == '"') return error.InvalidArguments;
+        }
+        if (needs_quotes) {
+            try buf.append('"');
+            try buf.appendSlice(arg0);
+            try buf.append('"');
+        } else {
+            try buf.appendSlice(arg0);
+        }
+
+        for (argv[1..]) |arg| {
+            try buf.append(' ');
+            needs_quotes = for (arg) |c| {
+                if (c <= ' ' or c == '"') break true;
+            } else arg.len == 0;
+            if (!needs_quotes) {
+                try buf.appendSlice(arg);
+                continue;
+            }
+            try buf.append('"');
+            var backslash_count: usize = 0;
+            for (arg) |byte| {
+                switch (byte) {
+                    '\\' => backslash_count += 1,
+                    '"' => {
+                        try buf.appendNTimes('\\', backslash_count * 2 + 1);
+                        try buf.append('"');
+                        backslash_count = 0;
+                    },
+                    else => {
+                        try buf.appendNTimes('\\', backslash_count);
+                        try buf.append(byte);
+                        backslash_count = 0;
+                    },
+                }
+            }
+            try buf.appendNTimes('\\', backslash_count * 2);
+            try buf.append('"');
+        }
+    }
+
+    return try std.unicode.wtf8ToWtf16LeAllocZ(allocator, buf.items);
+}
+
+fn argvToScriptCommandLineWindows(allocator: std.mem.Allocator, script_path: []const u16, script_args: []const []const u8) ![:0]u16 {
+    var buf = try std.ArrayList(u8).initCapacity(allocator, 64);
+    defer buf.deinit();
+
+    buf.appendSliceAssumeCapacity("cmd.exe /d /e:ON /v:OFF /c \"");
+    buf.appendAssumeCapacity('"');
+    if (std.mem.indexOfAny(u16, script_path, &[_]u16{ '\\', '/' }) == null) {
+        try buf.appendSlice(".\\");
+    }
+    try std.unicode.wtf16LeToWtf8ArrayList(&buf, script_path);
+    buf.appendAssumeCapacity('"');
+
+    for (script_args) |arg| {
+        if (std.mem.indexOfAny(u8, arg, "\x00\r\n") != null) return error.InvalidArguments;
+        try buf.append(' ');
+        var needs_quotes = arg.len == 0 or arg[arg.len - 1] == '\\';
+        if (!needs_quotes) {
+            for (arg) |c| {
+                switch (c) {
+                    'A'...'Z', 'a'...'z', '0'...'9', '#', '$', '*', '+', '-', '.', '/', ':', '?', '@', '\\', '_' => {},
+                    else => {
+                        needs_quotes = true;
+                        break;
+                    },
+                }
+            }
+        }
+        if (needs_quotes) try buf.append('"');
+        var backslashes: usize = 0;
+        for (arg) |c| {
+            switch (c) {
+                '\\' => backslashes += 1,
+                '"' => {
+                    try buf.appendNTimes('\\', backslashes);
+                    try buf.append('"');
+                    backslashes = 0;
+                },
+                '%' => {
+                    try buf.appendSlice("%%cd:~,");
+                    backslashes = 0;
+                },
+                else => backslashes = 0,
+            }
+            try buf.append(c);
+        }
+        if (needs_quotes) {
+            try buf.appendNTimes('\\', backslashes);
+            try buf.append('"');
+        }
+    }
+
+    try buf.append('"');
+    return try std.unicode.wtf8ToWtf16LeAllocZ(allocator, buf.items);
 }
 
 fn windowsWaitForReady(allocator: std.mem.Allocator, stdout_file: *std.fs.File) !bool {
@@ -888,7 +1170,6 @@ fn windowsMaybeStartRequest(allocator: std.mem.Allocator, state: *WindowsSharedS
         .pid = state.shell_pid,
         .broker_pid = process.currentPid(),
         .command_line = state.command_line,
-        .cwd = state.cwd,
     });
 }
 
@@ -963,7 +1244,6 @@ fn windowsMaybeFinalizeRequest(allocator: std.mem.Allocator, state: *WindowsShar
         .pid = state.shell_pid,
         .broker_pid = process.currentPid(),
         .command_line = state.command_line,
-        .cwd = state.cwd,
     });
 }
 
@@ -990,6 +1270,8 @@ fn windowsPumpStdout(state: *WindowsSharedState, file: std.fs.File) void {
         const parsed = protocol.parseStdoutChunk(windowsStdoutSink(state), buffer[0..bytes_read], &parse_state) catch break;
         windowsApplyParsedStdout(state, parsed);
     }
+
+    protocol.flushStdoutChunk(windowsStdoutSink(state), &parse_state) catch {};
 }
 
 fn windowsPumpStderr(state: *WindowsSharedState, file: std.fs.File) void {

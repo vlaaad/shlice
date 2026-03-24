@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const windows = std.os.windows;
 const broker = @import("broker.zig");
 const cli = @import("cli.zig");
 const fs_atomic = @import("fs_atomic.zig");
@@ -73,7 +74,7 @@ fn runList(allocator: std.mem.Allocator) !void {
     }
     try output.printStatusHeader(stdout);
     for (records) |record| {
-        try output.printStatusLine(stdout, record.id, @tagName(record.status), record.pid, record.broker_pid, record.command_line, record.cwd);
+        try output.printStatusLine(stdout, record.id, @tagName(record.status), record.pid, record.broker_pid, record.command_line);
     }
 }
 
@@ -96,7 +97,7 @@ fn runStatus(allocator: std.mem.Allocator, id: ?[]const u8) !u8 {
             defer registry.freeRecord(allocator, record);
             const stdout = std.io.getStdOut().writer();
             try output.printStatusHeader(stdout);
-            try output.printStatusLine(stdout, record.id, @tagName(record.status), record.pid, record.broker_pid, record.command_line, record.cwd);
+            try output.printStatusLine(stdout, record.id, @tagName(record.status), record.pid, record.broker_pid, record.command_line);
             return 0;
         }
         try output.printError("shell not found");
@@ -720,20 +721,122 @@ fn spawnBrokerWindows(allocator: std.mem.Allocator, root: []const u8, id: []cons
         @memcpy(extended[0..8], args[0..8]);
         extended[separator_index] = "--";
         @memcpy(extended[(separator_index + 1)..], command);
-
-        var child = std.process.Child.init(extended, allocator);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
+        try spawnDetachedWindowsProcess(allocator, extended, cwd);
         return;
     }
 
-    var child = std.process.Child.init(args, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
+    try spawnDetachedWindowsProcess(allocator, args, cwd);
+}
+
+const windows_create_no_window: windows.DWORD = 0x08000000;
+const windows_detached_process: windows.DWORD = 0x00000008;
+const windows_new_process_group: windows.DWORD = 0x00000200;
+const windows_detached_creation_flags: windows.DWORD =
+    windows.CREATE_UNICODE_ENVIRONMENT |
+    windows_create_no_window |
+    windows_detached_process |
+    windows_new_process_group;
+
+fn spawnDetachedWindowsProcess(allocator: std.mem.Allocator, argv: []const []const u8, cwd: []const u8) !void {
+    if (argv.len == 0) return error.InvalidArguments;
+
+    const app_path = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, argv[0]);
+    defer allocator.free(app_path);
+    const command_line = try argvToCommandLineWindows(allocator, argv);
+    defer allocator.free(command_line);
+
+    const cwd_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, cwd);
+    defer allocator.free(cwd_w);
+
+    var startup = windows.STARTUPINFOW{
+        .cb = @sizeOf(windows.STARTUPINFOW),
+        .hStdInput = null,
+        .hStdOutput = null,
+        .hStdError = null,
+        .dwFlags = 0,
+        .lpReserved = null,
+        .lpDesktop = null,
+        .lpTitle = null,
+        .dwX = 0,
+        .dwY = 0,
+        .dwXSize = 0,
+        .dwYSize = 0,
+        .dwXCountChars = 0,
+        .dwYCountChars = 0,
+        .dwFillAttribute = 0,
+        .wShowWindow = 0,
+        .cbReserved2 = 0,
+        .lpReserved2 = null,
+    };
+    var process_info: windows.PROCESS_INFORMATION = undefined;
+
+    try windows.CreateProcessW(
+        app_path.ptr,
+        command_line.ptr,
+        null,
+        null,
+        windows.FALSE,
+        windows_detached_creation_flags,
+        null,
+        cwd_w.ptr,
+        &startup,
+        &process_info,
+    );
+    defer std.posix.close(process_info.hProcess);
+    defer std.posix.close(process_info.hThread);
+}
+
+fn argvToCommandLineWindows(allocator: std.mem.Allocator, argv: []const []const u8) ![:0]u16 {
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+
+    if (argv.len != 0) {
+        const arg0 = argv[0];
+        var needs_quotes = arg0.len == 0;
+        for (arg0) |c| {
+            if (c <= ' ') needs_quotes = true;
+            if (c == '"') return error.InvalidArguments;
+        }
+        if (needs_quotes) {
+            try buf.append('"');
+            try buf.appendSlice(arg0);
+            try buf.append('"');
+        } else {
+            try buf.appendSlice(arg0);
+        }
+
+        for (argv[1..]) |arg| {
+            try buf.append(' ');
+            needs_quotes = for (arg) |c| {
+                if (c <= ' ' or c == '"') break true;
+            } else arg.len == 0;
+            if (!needs_quotes) {
+                try buf.appendSlice(arg);
+                continue;
+            }
+            try buf.append('"');
+            var backslash_count: usize = 0;
+            for (arg) |byte| {
+                switch (byte) {
+                    '\\' => backslash_count += 1,
+                    '"' => {
+                        try buf.appendNTimes('\\', backslash_count * 2 + 1);
+                        try buf.append('"');
+                        backslash_count = 0;
+                    },
+                    else => {
+                        try buf.appendNTimes('\\', backslash_count);
+                        try buf.append(byte);
+                        backslash_count = 0;
+                    },
+                }
+            }
+            try buf.appendNTimes('\\', backslash_count * 2);
+            try buf.append('"');
+        }
+    }
+
+    return try std.unicode.wtf8ToWtf16LeAllocZ(allocator, buf.items);
 }
 
 const StartupWaitResult = union(enum) {

@@ -63,9 +63,29 @@ pub const StdoutParse = struct {
 
 pub const StdoutParseState = struct {
     inside_prompt: bool = false,
+    pending: [256]u8 = undefined,
+    pending_len: usize = 0,
 };
 
 pub fn parseStdoutChunk(writer: anytype, chunk: []const u8, state: *StdoutParseState) !StdoutParse {
+    if (state.pending_len != 0) {
+        const pending_len = state.pending_len;
+        const merged_len = pending_len + chunk.len;
+        if (merged_len <= 8192) {
+            var merged: [8192]u8 = undefined;
+            @memcpy(merged[0..pending_len], state.pending[0..pending_len]);
+            @memcpy(merged[pending_len..merged_len], chunk);
+            state.pending_len = 0;
+            return parseStdoutChunkNoPending(writer, merged[0..merged_len], state);
+        }
+        try writer.writeAll(state.pending[0..pending_len]);
+        state.pending_len = 0;
+    }
+
+    return parseStdoutChunkNoPending(writer, chunk, state);
+}
+
+fn parseStdoutChunkNoPending(writer: anytype, chunk: []const u8, state: *StdoutParseState) !StdoutParse {
     var result = StdoutParse{
         .wrote_data = false,
         .began_request = false,
@@ -90,8 +110,12 @@ pub fn parseStdoutChunk(writer: anytype, chunk: []const u8, state: *StdoutParseS
         }
 
         const marker_end = std.mem.indexOfScalarPos(u8, chunk, escape_index, 0x07) orelse {
-            if (!state.inside_prompt) {
-                try writer.writeAll(chunk[escape_index..]);
+            const tail = chunk[escape_index..];
+            if (tail.len <= state.pending.len) {
+                @memcpy(state.pending[0..tail.len], tail);
+                state.pending_len = tail.len;
+            } else {
+                try writer.writeAll(tail);
                 result.wrote_data = true;
             }
             break;
@@ -119,6 +143,12 @@ pub fn parseStdoutChunk(writer: anytype, chunk: []const u8, state: *StdoutParseS
     }
 
     return result;
+}
+
+pub fn flushStdoutChunk(writer: anytype, state: *StdoutParseState) !void {
+    if (state.pending_len == 0) return;
+    try writer.writeAll(state.pending[0..state.pending_len]);
+    state.pending_len = 0;
 }
 
 pub fn chunkContainsReady(chunk: []const u8) bool {
@@ -154,6 +184,22 @@ test "parse stdout strips prompt text" {
     try std.testing.expect(parsed.ended_request);
     try std.testing.expect(parsed.finished_prompt);
     try std.testing.expectEqualStrings("1\n", out.items);
+}
+
+test "parse stdout keeps split markers across chunks" {
+    var out = std.ArrayList(u8).init(std.testing.allocator);
+    defer out.deinit();
+    var state = StdoutParseState{};
+    const chunk1 = "hello" ++ command_begin_marker[0 .. command_begin_marker.len - 1];
+    const parsed1 = try parseStdoutChunk(out.writer(), chunk1, &state);
+    try std.testing.expect(!parsed1.began_request);
+    try std.testing.expectEqualStrings("hello", out.items);
+
+    const chunk2 = "\x07world" ++ command_done_prefix ++ "0\x07";
+    const parsed2 = try parseStdoutChunk(out.writer(), chunk2, &state);
+    try std.testing.expect(parsed2.began_request);
+    try std.testing.expect(parsed2.ended_request);
+    try std.testing.expectEqualStrings("helloworld", out.items);
 }
 
 test "ready accepts prompt marker" {
