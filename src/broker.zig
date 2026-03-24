@@ -13,7 +13,22 @@ const completion_file_name = "completion.json";
 const stdout_file_name = "stdout.log";
 const stderr_file_name = "stderr.log";
 const completion_grace_ms: i64 = 100;
+const command_begin_timeout_ms: i64 = 1000;
 const ready_timeout_ms: i64 = 30000;
+
+const RequestFinishReason = enum {
+    complete,
+    incomplete_command,
+    shutdown,
+};
+
+const RequestProgress = struct {
+    shutdown: bool,
+    request_started_at_ms: ?i64,
+    saw_begin: bool,
+    saw_end: bool,
+    completion_ready_at_ms: ?i64,
+};
 
 const SharedState = struct {
     allocator: std.mem.Allocator,
@@ -29,8 +44,8 @@ const SharedState = struct {
     active_exit_code: ?i32 = null,
     saw_begin: bool = false,
     saw_end: bool = false,
-    saw_prompt_after_end: bool = false,
-    completion_observed_at_ms: ?i64 = null,
+    completion_ready_at_ms: ?i64 = null,
+    request_started_at_ms: ?i64 = null,
     shutdown: bool = false,
 };
 
@@ -294,7 +309,8 @@ fn maybeStartRequest(allocator: std.mem.Allocator, shared: *SharedState, stdin_f
     shared.active_exit_code = null;
     shared.saw_begin = false;
     shared.saw_end = false;
-    shared.completion_observed_at_ms = null;
+    shared.completion_ready_at_ms = null;
+    shared.request_started_at_ms = std.time.milliTimestamp();
     try registry.upsert(allocator, shared.root, .{
         .id = shared.id,
         .status = .busy,
@@ -310,33 +326,45 @@ fn maybeFinalizeRequest(allocator: std.mem.Allocator, shared: *SharedState) !voi
     var stdout_log: ?std.fs.File = null;
     var stderr_log: ?std.fs.File = null;
     var exit_code: i32 = 1;
-    var should_finish = false;
-    var shutting_down = false;
+    var finish_reason: ?RequestFinishReason = null;
 
     shared.mutex.lock();
-    shutting_down = shared.shutdown;
     if (shared.active_request_id) |active_id| {
-        const completion_ready = shared.saw_end and shared.saw_prompt_after_end and shared.completion_observed_at_ms != null and std.time.milliTimestamp() - shared.completion_observed_at_ms.? >= completion_grace_ms;
-        if (completion_ready or shutting_down) {
-            should_finish = true;
+        finish_reason = requestFinishReason(.{
+            .shutdown = shared.shutdown,
+            .request_started_at_ms = shared.request_started_at_ms,
+            .saw_begin = shared.saw_begin,
+            .saw_end = shared.saw_end,
+            .completion_ready_at_ms = shared.completion_ready_at_ms,
+        }, std.time.milliTimestamp());
+        if (finish_reason != null) {
             request_id = active_id;
             stdout_log = shared.active_stdout;
             stderr_log = shared.active_stderr;
-            exit_code = shared.active_exit_code orelse if (shutting_down) 124 else 1;
+            exit_code = shared.active_exit_code orelse switch (finish_reason.?) {
+                .shutdown => 124,
+                .incomplete_command => 1,
+                .complete => 1,
+            };
             shared.active_request_id = null;
             shared.active_stdout = null;
             shared.active_stderr = null;
             shared.active_exit_code = null;
             shared.saw_begin = false;
             shared.saw_end = false;
-            shared.saw_prompt_after_end = false;
-            shared.completion_observed_at_ms = null;
+            shared.completion_ready_at_ms = null;
+            shared.request_started_at_ms = null;
         }
     }
     shared.mutex.unlock();
 
-    if (!should_finish) return;
+    if (finish_reason == null) return;
 
+    if (finish_reason.? == .incomplete_command) {
+        if (stderr_log) |file| {
+            try file.writer().writeAll("error: incomplete command\n");
+        }
+    }
     if (stdout_log) |file| file.close();
     if (stderr_log) |file| file.close();
 
@@ -348,7 +376,7 @@ fn maybeFinalizeRequest(allocator: std.mem.Allocator, shared: *SharedState) !voi
     const completion = try protocol.stringifyCompletion(allocator, .{
         .id = request_id.?,
         .exit_code = exit_code,
-        .timed_out = shutting_down and exit_code == 124,
+        .timed_out = finish_reason.? == .shutdown and exit_code == 124,
     });
     defer allocator.free(completion);
     try fs_atomic.writeFileAbsolute(allocator, completion_path, completion);
@@ -362,6 +390,17 @@ fn maybeFinalizeRequest(allocator: std.mem.Allocator, shared: *SharedState) !voi
         .command_line = shared.command_line,
         .cwd = shared.cwd,
     });
+}
+
+fn requestFinishReason(progress: RequestProgress, now_ms: i64) ?RequestFinishReason {
+    if (progress.shutdown) return .shutdown;
+    if (!progress.saw_begin and progress.request_started_at_ms != null and now_ms - progress.request_started_at_ms.? >= command_begin_timeout_ms) {
+        return .incomplete_command;
+    }
+    if (progress.saw_end and progress.completion_ready_at_ms != null and now_ms - progress.completion_ready_at_ms.? >= completion_grace_ms) {
+        return .complete;
+    }
+    return null;
 }
 
 fn pumpStdout(shared: *SharedState, file: std.fs.File) void {
@@ -400,8 +439,7 @@ fn applyParsedStdout(shared: *SharedState, parsed: protocol.StdoutParse) void {
     if (parsed.began_request) {
         shared.saw_begin = true;
         shared.saw_end = false;
-        shared.saw_prompt_after_end = false;
-        shared.completion_observed_at_ms = null;
+        shared.completion_ready_at_ms = null;
         shared.active_exit_code = null;
     }
 
@@ -411,8 +449,7 @@ fn applyParsedStdout(shared: *SharedState, parsed: protocol.StdoutParse) void {
     }
 
     if (parsed.finished_prompt and shared.saw_begin and shared.saw_end) {
-        shared.saw_prompt_after_end = true;
-        shared.completion_observed_at_ms = std.time.milliTimestamp();
+        shared.completion_ready_at_ms = std.time.milliTimestamp();
     }
 }
 
@@ -501,7 +538,7 @@ test "ignore end marker until request begins" {
     });
     try std.testing.expect(!shared.saw_begin);
     try std.testing.expect(!shared.saw_end);
-    try std.testing.expect(!shared.saw_prompt_after_end);
+    try std.testing.expectEqual(@as(?i64, null), shared.completion_ready_at_ms);
     try std.testing.expectEqual(@as(?i32, null), shared.active_exit_code);
 
     applyParsedStdout(&shared, .{
@@ -518,7 +555,7 @@ test "ignore end marker until request begins" {
         .finished_prompt = false,
         .exit_code = 7,
     });
-    try std.testing.expect(!shared.saw_prompt_after_end);
+    try std.testing.expectEqual(@as(?i64, null), shared.completion_ready_at_ms);
 
     applyParsedStdout(&shared, .{
         .wrote_data = false,
@@ -529,7 +566,29 @@ test "ignore end marker until request begins" {
     });
     try std.testing.expect(shared.saw_begin);
     try std.testing.expect(shared.saw_end);
-    try std.testing.expect(shared.saw_prompt_after_end);
-    try std.testing.expect(shared.completion_observed_at_ms != null);
+    try std.testing.expect(shared.completion_ready_at_ms != null);
     try std.testing.expectEqual(@as(?i32, 7), shared.active_exit_code);
+}
+
+test "request times out waiting for command begin" {
+    try std.testing.expectEqual(
+        @as(?RequestFinishReason, .incomplete_command),
+        requestFinishReason(.{
+            .shutdown = false,
+            .request_started_at_ms = 1000,
+            .saw_begin = false,
+            .saw_end = false,
+            .completion_ready_at_ms = null,
+        }, 2001),
+    );
+    try std.testing.expectEqual(
+        @as(?RequestFinishReason, null),
+        requestFinishReason(.{
+            .shutdown = false,
+            .request_started_at_ms = 1000,
+            .saw_begin = false,
+            .saw_end = false,
+            .completion_ready_at_ms = null,
+        }, 1999),
+    );
 }

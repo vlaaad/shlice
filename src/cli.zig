@@ -91,7 +91,9 @@ fn parseStart(args: []const []const u8) !StartOptions {
         return error.InvalidArguments;
     }
 
+    if (separator_index == null) return error.InvalidArguments;
     const command = if (separator_index) |start| args[(start + 1)..] else args[args.len..args.len];
+    if (command.len == 0) return error.InvalidArguments;
     return .{ .id = id, .command = command };
 }
 
@@ -200,6 +202,10 @@ test "start parses separator command" {
     try std.testing.expect(parsed == .start);
     try std.testing.expectEqualStrings("demo", parsed.start.id.?);
     try std.testing.expectEqual(@as(usize, 3), parsed.start.command.len);
+}
+
+test "start requires a command" {
+    try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{ "shlice", "start" }));
 }
 
 test "stop defaults id to main" {

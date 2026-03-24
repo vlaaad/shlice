@@ -20,11 +20,13 @@ test "start osc repl, exec twice, stop" {
     const shlice_exe = try findShliceExe(allocator);
     defer allocator.free(shlice_exe);
 
-    const clj_exe = try maybeFindCommand(allocator, "clj");
-    defer if (clj_exe) |path| allocator.free(path);
-    const clojure_exe = try maybeFindCommand(allocator, "clojure");
+    const clj_exe = try process.resolveExecutable(allocator, "clj");
+    defer allocator.free(clj_exe);
+    const clojure_exe = process.resolveExecutable(allocator, "clojure") catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
     defer if (clojure_exe) |path| allocator.free(path);
-    if (clj_exe == null and clojure_exe == null) return error.SkipZigTest;
 
     const workspace_root = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(workspace_root);
@@ -95,6 +97,69 @@ test "start osc repl, exec twice, stop" {
     try std.testing.expectEqualStrings("stopped osc-repl-test\n", stop_stdout);
     try std.testing.expectEqualStrings("", stop_stderr);
     stop_needed = false;
+}
+
+test "exec incomplete command times out and shell recovers" {
+    const allocator = std.testing.allocator;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const shlice_exe = try findShliceExe(allocator);
+    defer allocator.free(shlice_exe);
+
+    const clj_exe = try process.resolveExecutable(allocator, "clj");
+    defer allocator.free(clj_exe);
+    const clojure_exe = process.resolveExecutable(allocator, "clojure") catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (clojure_exe) |path| allocator.free(path);
+
+    const workspace_root = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_root);
+
+    const osc_repl = "osc-repl.clj";
+
+    const sandbox = try createSandbox(allocator, workspace_root);
+    defer sandbox.deinit();
+
+    var env = try std.process.getEnvMap(allocator);
+    defer env.deinit();
+
+    try configureEnv(&env, sandbox.root, sandbox.home);
+
+    const shell_id = "osc-repl-timeout-test";
+
+    var stop_needed = false;
+    defer if (stop_needed) {
+        if (runCommand(allocator, &env, workspace_root, &.{ shlice_exe, "stop", shell_id })) |stop_result| {
+            defer stop_result.deinit(allocator);
+        } else |_| {}
+    };
+
+    const start_result = try startRepl(allocator, &env, workspace_root, shlice_exe, shell_id, osc_repl, clj_exe, clojure_exe);
+    defer start_result.deinit(allocator);
+    try expectExitCode(start_result.term, 0, start_result.stdout, start_result.stderr);
+    stop_needed = true;
+
+    const incomplete_exec = try runCommand(allocator, &env, workspace_root, &.{ shlice_exe, "exec", "--id", shell_id, "(+ 1" });
+    defer incomplete_exec.deinit(allocator);
+    try expectExitCode(incomplete_exec.term, 1, incomplete_exec.stdout, incomplete_exec.stderr);
+    const incomplete_stdout = try normalizeNewlinesOwned(allocator, incomplete_exec.stdout);
+    defer allocator.free(incomplete_stdout);
+    const incomplete_stderr = try normalizeNewlinesOwned(allocator, incomplete_exec.stderr);
+    defer allocator.free(incomplete_stderr);
+    try std.testing.expectEqualStrings("", incomplete_stdout);
+    try std.testing.expectEqualStrings("error: incomplete command\n", incomplete_stderr);
+
+    const completion_exec = try runCommand(allocator, &env, workspace_root, &.{ shlice_exe, "exec", "--id", shell_id, "2)" });
+    defer completion_exec.deinit(allocator);
+    try expectExitCode(completion_exec.term, 0, completion_exec.stdout, completion_exec.stderr);
+    const completion_stdout = try normalizeNewlinesOwned(allocator, completion_exec.stdout);
+    defer allocator.free(completion_stdout);
+    const completion_stderr = try normalizeNewlinesOwned(allocator, completion_exec.stderr);
+    defer allocator.free(completion_stderr);
+    try std.testing.expectEqualStrings("3\n", completion_stdout);
+    try std.testing.expectEqualStrings("", completion_stderr);
 }
 
 const Sandbox = struct {
@@ -168,13 +233,6 @@ fn fallbackShliceExe(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ workspace_root, "zig-out", "bin", exe_name });
 }
 
-fn maybeFindCommand(allocator: std.mem.Allocator, command: []const u8) !?[]u8 {
-    return process.resolveExecutable(allocator, command) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => err,
-    };
-}
-
 fn startRepl(
     allocator: std.mem.Allocator,
     env: *const std.process.EnvMap,
@@ -182,20 +240,16 @@ fn startRepl(
     shlice_exe: []const u8,
     shell_id: []const u8,
     osc_repl: []const u8,
-    clj_exe: ?[]const u8,
+    clj_exe: []const u8,
     clojure_exe: ?[]const u8,
 ) !CommandResult {
-    if (clj_exe) |path| {
-        const clj_result = try runCommand(allocator, env, cwd, &.{ shlice_exe, "start", "--id", shell_id, "--", path, "-M", osc_repl });
+    const clj_result = try runCommand(allocator, env, cwd, &.{ shlice_exe, "start", "--id", shell_id, "--", clj_exe, "-M", osc_repl });
+    if (clojure_exe) |path| {
         if (exitedWithCode(clj_result.term, 0)) return clj_result;
         clj_result.deinit(allocator);
-    }
-
-    if (clojure_exe) |path| {
         return runCommand(allocator, env, cwd, &.{ shlice_exe, "start", "--id", shell_id, "--", path, "-M", osc_repl });
     }
-
-    return error.SkipZigTest;
+    return clj_result;
 }
 
 fn runCommand(allocator: std.mem.Allocator, env: *const std.process.EnvMap, cwd: []const u8, argv: []const []const u8) !CommandResult {

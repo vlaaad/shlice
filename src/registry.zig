@@ -5,7 +5,6 @@ const shell_id = @import("shell_id.zig");
 const state_dir = @import("state_dir.zig");
 
 pub const ShellStatus = enum {
-    stopped,
     busy,
     ready,
 };
