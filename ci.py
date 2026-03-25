@@ -12,10 +12,10 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
-WORKFLOW_NAME = "Zig CI"
+WORKFLOW_NAME = "Rust CI"
 POLL_SECONDS = 3
 POLL_TIMEOUT_SECONDS = 180
-WATCH_TIMEOUT_SECONDS = 900
+WATCH_TIMEOUT_SECONDS = 180
 WATCH_STALE_WARN_SECONDS = 180
 
 if os.name == "nt":
@@ -139,6 +139,10 @@ def watch_run(repo: str, run_id: int) -> int:
             warned = True
 
         if time.monotonic() >= deadline:
+            try:
+                run("gh", "api", f"repos/{repo}/actions/runs/{run_id}/cancel", "-X", "POST")
+            except Exception:
+                pass
             raise RuntimeError(
                 f"workflow run {run_id} exceeded {WATCH_TIMEOUT_SECONDS}s without completing"
             )

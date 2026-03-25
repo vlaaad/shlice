@@ -1,0 +1,26 @@
+[package]
+name = "shlice"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fs2 = "0.4"
+interprocess = "2.4"
+pico-args = "=0.5.0"
+itoa = "=1.0.3"
+ryu = "=1.0.11"
+proc-macro2 = "=1.0.43"
+quote = "=1.0.21"
+serde = { version = "=1.0.144", features = ["derive"] }
+serde_json = "=1.0.85"
+syn = "=1.0.100"
+thiserror = "=1.0.38"
+unicode-ident = "=1.0.4"
+
+[[bin]]
+name = "shlice"
+path = "src/main.rs"
+
+[[bin]]
+name = "fake_shell"
+path = "src/bin/fake_shell.rs"
