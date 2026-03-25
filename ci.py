@@ -12,7 +12,7 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
-WORKFLOW_NAME = "Zig CI"
+WORKFLOW_NAME = "Rust CI"
 POLL_SECONDS = 3
 POLL_TIMEOUT_SECONDS = 180
 WATCH_TIMEOUT_SECONDS = 900
