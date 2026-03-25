@@ -73,9 +73,8 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $PWD ($archive -replace '\.zip$', ''))
       - name: Compile tests
         run: zig build test-compile -Dtarget=${{ matrix.target }}
-      - name: Build test binary
-        if: matrix.run_tests
-        run: zig build -Dtarget=${{ matrix.target }}
+      - name: Build release binary
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSmall
       - name: Run unit tests
         if: matrix.run_tests
         run: zig test src/main.zig -Dtarget=${{ matrix.target }}
@@ -109,8 +108,6 @@ jobs:
         env:
           SHLICE_TEST_EXE: ${{ matrix.target == 'x86_64-windows' && 'zig-out/bin/shlice.exe' || 'zig-out/bin/shlice' }}
         run: zig test src/integration_test.zig -Dtarget=${{ matrix.target }} --test-filter "start fails fast on missing shell command"
-      - name: Build release binary
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSmall
       - name: Upload release binary
         uses: actions/upload-artifact@v7
         with:
