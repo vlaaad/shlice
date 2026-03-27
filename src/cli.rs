@@ -134,8 +134,22 @@ fn parse_exec(mut args: Arguments) -> Result<ExecOptions> {
 }
 
 fn parse_stop(mut args: Arguments) -> Result<StopOptions> {
-    let id = opt_shell_id(&mut args, "--id")?.unwrap_or_else(|| "main".to_string());
-    ensure_empty(args)?;
+    let flag_id = opt_shell_id(&mut args, "--id")?;
+    let remaining = args.finish();
+    let positional_id = match remaining.len() {
+        0 => None,
+        1 => {
+            let id = string_arg(remaining.into_iter().next().unwrap())?;
+            shell_id::validate(&id).map_err(|m| AppError::Msg(m.to_string()))?;
+            Some(id)
+        }
+        _ => return Err(AppError::Msg("invalid arguments".to_string())),
+    };
+    let id = match (flag_id, positional_id) {
+        (Some(_), Some(_)) => return Err(AppError::Msg("invalid arguments".to_string())),
+        (Some(id), None) | (None, Some(id)) => id,
+        (None, None) => "main".to_string(),
+    };
     Ok(StopOptions { id })
 }
 

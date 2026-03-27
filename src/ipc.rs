@@ -3,7 +3,7 @@ use interprocess::local_socket::{
     prelude::*, ConnectOptions, GenericFilePath, ListenerNonblockingMode, ListenerOptions,
 };
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct IpcListener {
     listener: interprocess::local_socket::Listener,
@@ -59,7 +59,12 @@ pub fn open_fifo_read_write(path: &Path) -> Result<IpcStream> {
     }
 }
 
-pub fn remove_fifo(_path: &Path) {}
+pub fn remove_fifo(path: &Path) {
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file(socket_path(path));
+    }
+}
 
 pub fn send_frame_file(
     mut file: impl Write,
@@ -127,5 +132,33 @@ fn socket_name(path: &Path) -> String {
         format!(r"\\.\pipe\shlice-{hash:016x}")
     } else {
         format!("/tmp/shlice-{hash:016x}.sock")
+    }
+}
+
+fn socket_path(path: &Path) -> PathBuf {
+    PathBuf::from(socket_name(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn remove_fifo_unlinks_socket_path() {
+        let path = std::env::temp_dir().join(format!(
+            "shlice-ipc-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let socket = socket_path(&path);
+        let listener = create_fifo(&path).unwrap();
+        assert!(socket.exists(), "socket missing: {socket:?}");
+        drop(listener);
+        remove_fifo(&path);
+        assert!(!socket.exists(), "socket still exists: {socket:?}");
     }
 }

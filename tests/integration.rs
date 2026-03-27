@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -46,6 +46,19 @@ fn workspace() -> PathBuf {
     base.push(format!("shlice-test-{}-{stamp}-{seq}", std::process::id(),));
     fs::create_dir_all(&base).unwrap();
     base
+}
+
+#[cfg(not(windows))]
+fn socket_path(path: &Path) -> PathBuf {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    PathBuf::from(format!("/tmp/shlice-{hash:016x}.sock"))
 }
 
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
@@ -336,6 +349,31 @@ fn restart_after_stop() {
 }
 
 #[test]
+fn stop_accepts_positional_shell_id() {
+    let workspace = workspace();
+    let shlice = exe("shlice");
+    let fake_shell = exe("fake_shell");
+    assert!(run(Command::new(&shlice)
+        .current_dir(&workspace)
+        .arg("start")
+        .arg("--id")
+        .arg("custom")
+        .arg("--")
+        .arg(&fake_shell))
+    .status
+    .success());
+
+    let out = run(Command::new(&shlice)
+        .current_dir(&workspace)
+        .arg("stop")
+        .arg("custom"));
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "stopped custom\n");
+    assert_eq!(stderr, "");
+}
+
+#[test]
 fn incomplete_command_recovers() {
     let workspace = workspace();
     let shlice = exe("shlice");
@@ -423,6 +461,49 @@ fn timed_out_exec_does_not_break_next_exec() {
 }
 
 #[test]
+fn status_reports_busy_during_exec() {
+    let workspace = workspace();
+    let shlice = exe("shlice");
+    let fake_shell = exe("fake_shell");
+    assert!(run(Command::new(&shlice)
+        .current_dir(&workspace)
+        .arg("start")
+        .arg("--")
+        .arg(&fake_shell))
+    .status
+    .success());
+
+    let exec = Command::new(&shlice)
+        .current_dir(&workspace)
+        .arg("exec")
+        .arg("--timeout")
+        .arg("10")
+        .arg("(do :first (Thread/sleep 1000))")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(200));
+
+    let status = run(Command::new(&shlice).current_dir(&workspace).arg("status"));
+    let (stdout, stderr) = text(&status);
+    assert!(status.status.success(), "stdout={stdout:?} stderr={stderr:?}");
+    assert!(stdout.contains("main\tbusy\t"), "stdout={stdout:?}");
+    assert_eq!(stderr, "");
+
+    let exec_out = exec.wait_with_output().unwrap();
+    let (stdout, stderr) = text(&exec_out);
+    assert!(exec_out.status.success(), "stdout={stdout:?} stderr={stderr:?}");
+
+    assert!(
+        run(Command::new(&shlice).current_dir(&workspace).arg("stop"))
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn stop_does_not_claim_success_while_exec_lock_is_busy() {
     let workspace = workspace();
     let shlice = exe("shlice");
@@ -488,6 +569,71 @@ fn stop_does_not_claim_success_while_exec_lock_is_busy() {
 }
 
 #[test]
+fn stop_does_not_force_kill_exec_client_waiting_for_stdin() {
+    let workspace = workspace();
+    let shlice = exe("shlice");
+    let fake_shell = exe("fake_shell");
+    assert!(run(Command::new(&shlice)
+        .current_dir(&workspace)
+        .arg("start")
+        .arg("--")
+        .arg(&fake_shell))
+    .status
+    .success());
+
+    let mut exec = Command::new(&shlice)
+        .current_dir(&workspace)
+        .arg("exec")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(200));
+
+    let started = Instant::now();
+    let stop = run_with_timeout(
+        Command::new(&shlice).current_dir(&workspace).arg("stop"),
+        Duration::from_secs(5),
+        "stop while exec waits for stdin",
+    );
+    let elapsed = started.elapsed();
+    let (stdout, stderr) = text(&stop);
+    assert!(
+        stop.status.success(),
+        "stdout={stdout:?} stderr={stderr:?} elapsed={elapsed:?}",
+    );
+    assert!(elapsed < Duration::from_secs(3), "elapsed={elapsed:?}");
+    assert_eq!(stdout, "stopped main\n");
+    assert_eq!(stderr, "");
+
+    let status = run(Command::new(&shlice).current_dir(&workspace).arg("status"));
+    let (stdout, stderr) = text(&status);
+    assert!(status.status.success());
+    assert_eq!(stdout, "no shells\n");
+    assert_eq!(stderr, "");
+
+    drop(exec.stdin.take());
+    let exec_out = exec.wait_with_output().unwrap();
+    let (stdout, stderr) = text(&exec_out);
+    assert_eq!(exec_out.status.code(), Some(1));
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "error: missing command\n");
+
+    let restart = run(Command::new(&shlice)
+        .current_dir(&workspace)
+        .arg("start")
+        .arg("--")
+        .arg(&fake_shell));
+    let (stdout, stderr) = text(&restart);
+    assert!(
+        restart.status.success(),
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
+#[test]
 fn state_stays_in_shlice() {
     let workspace = workspace();
     let shlice = exe("shlice");
@@ -525,4 +671,35 @@ fn state_stays_in_shlice() {
         .status()
         .unwrap();
     assert!(stop.success());
+}
+
+#[test]
+fn unix_socket_paths_are_removed_after_stop() {
+    if cfg!(windows) {
+        return;
+    }
+
+    let workspace = workspace();
+    let shlice = exe("shlice");
+    let fake_shell = exe("fake_shell");
+    let root = workspace.join(".shlice").join("shells").join("main");
+    let startup_socket = socket_path(&root.join("startup.fifo"));
+    let control_socket = socket_path(&root.join("control.fifo"));
+
+    let start = run(Command::new(&shlice)
+        .current_dir(&workspace)
+        .arg("start")
+        .arg("--")
+        .arg(&fake_shell));
+    let (stdout, stderr) = text(&start);
+    assert!(start.status.success(), "stdout={stdout:?} stderr={stderr:?}");
+    assert!(!startup_socket.exists(), "startup socket still exists: {startup_socket:?}");
+
+    let stop = run(Command::new(&shlice).current_dir(&workspace).arg("stop"));
+    let (stdout, stderr) = text(&stop);
+    assert!(stop.status.success(), "stdout={stdout:?} stderr={stderr:?}");
+    assert!(
+        !control_socket.exists(),
+        "control socket still exists: {control_socket:?}"
+    );
 }

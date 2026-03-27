@@ -59,7 +59,7 @@ fn run_list() -> Result<u8> {
         print_status_line(
             io::stdout(),
             &record.id,
-            status_name(&record.status),
+            display_status(&root, &record)?,
             record.pid,
             record.broker_pid,
             &record.command_line,
@@ -86,7 +86,7 @@ fn run_status(id: Option<String>) -> Result<u8> {
                 print_status_line(
                     io::stdout(),
                     &record.id,
-                    status_name(&record.status),
+                    display_status(&root, &record)?,
                     record.pid,
                     record.broker_pid,
                     &record.command_line,
@@ -214,7 +214,6 @@ fn run_exec(opts: ExecOptions) -> Result<u8> {
             return Ok(1);
         }
     };
-    let _guard = wait_for_lock(&root, &opts.id, "exec", opts.timeout_seconds)?;
     let command = match opts.command {
         Some(command) => command,
         None => {
@@ -227,6 +226,7 @@ fn run_exec(opts: ExecOptions) -> Result<u8> {
         print_error("missing command");
         return Ok(1);
     }
+    let _guard = wait_for_lock(&root, &opts.id, "exec", opts.timeout_seconds)?;
     let reply_path = root
         .join("shells")
         .join(&opts.id)
@@ -530,9 +530,13 @@ fn wait_for_lock(
     }
 }
 
-fn status_name(status: &ShellStatus) -> &str {
-    match status {
-        ShellStatus::Starting | ShellStatus::Busy => "busy",
-        ShellStatus::Ready => "ready",
+fn display_status(root: &std::path::Path, record: &crate::ShellRecord) -> Result<&'static str> {
+    match record.status {
+        ShellStatus::Starting | ShellStatus::Busy => Ok("busy"),
+        ShellStatus::Ready => match acquire_lock(root, &record.id, "exec") {
+            Ok(_guard) => Ok("ready"),
+            Err(AppError::Msg(message)) if message == "busy" => Ok("busy"),
+            Err(err) => Err(err),
+        },
     }
 }
