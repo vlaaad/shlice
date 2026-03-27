@@ -1,7 +1,5 @@
-/.zig-cache/
-/zig-out/
-/__pycache__/
-/dist/
-/.clj-kondo
-/.cpcache
-/.lsp
+/target/
+/.shlice/
+/Cargo.lock
+/__pycache__
+/dist
