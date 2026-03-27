@@ -35,9 +35,14 @@ pub fn print_status_line(
     command_line: &str,
 ) -> io::Result<()> {
     match (pid, broker_pid) {
-        (Some(pid), Some(broker_pid)) => writeln!(writer, "{id}\t{status}\t{pid}\t{broker_pid}\t{command_line}"),
+        (Some(pid), Some(broker_pid)) => writeln!(
+            writer,
+            "{id}\t{status}\t{pid}\t{broker_pid}\t{command_line}"
+        ),
         (Some(pid), None) => writeln!(writer, "{id}\t{status}\t{pid}\t-\t{command_line}"),
-        (None, Some(broker_pid)) => writeln!(writer, "{id}\t{status}\t-\t{broker_pid}\t{command_line}"),
+        (None, Some(broker_pid)) => {
+            writeln!(writer, "{id}\t{status}\t-\t{broker_pid}\t{command_line}")
+        }
         (None, None) => writeln!(writer, "{id}\t{status}\t-\t-\t{command_line}"),
     }
 }

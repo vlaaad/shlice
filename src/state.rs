@@ -85,7 +85,8 @@ pub fn list_states(root: &Path) -> Result<Vec<ShellRecord>> {
             continue;
         }
         match File::open(&path).and_then(|file| {
-            serde_json::from_reader(file).map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+            serde_json::from_reader(file)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
         }) {
             Ok(record) => records.push(record),
             Err(_) => continue,
@@ -117,9 +118,14 @@ pub fn remove_shell(root: &Path, id: &str) -> Result<()> {
 pub fn acquire_lock(root: &Path, id: &str, kind: &str) -> Result<LockGuard> {
     let dir = ensure_shell_dir(root, id)?;
     let path = dir.join(format!("{kind}.lock"));
-    let file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)?;
     if let Err(err) = file.try_lock_exclusive() {
-        if err.kind() == std::io::ErrorKind::WouldBlock {
+        let contended = fs2::lock_contended_error();
+        if err.kind() == contended.kind() || err.raw_os_error() == contended.raw_os_error() {
             return Err(AppError::Msg("busy".to_string()));
         }
         return Err(err.into());
@@ -141,7 +147,9 @@ impl Drop for LockGuard {
 }
 
 fn atomic_write_json(path: &Path, value: &ShellRecord) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| AppError::Msg("invalid path".to_string()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Msg("invalid path".to_string()))?;
     fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(
         ".{}.tmp-{}",
@@ -149,10 +157,7 @@ fn atomic_write_json(path: &Path, value: &ShellRecord) -> Result<()> {
         std::process::id()
     ));
     {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         serde_json::to_writer_pretty(&file, value)?;
         file.sync_all()?;
     }

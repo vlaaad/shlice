@@ -51,7 +51,8 @@ mod windows {
         if pid == 0 {
             return false;
         }
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
         if handle.is_null() {
             return false;
         }

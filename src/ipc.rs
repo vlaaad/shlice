@@ -1,5 +1,7 @@
 use crate::{Frame, FrameKind, Result};
-use interprocess::local_socket::{prelude::*, ConnectOptions, GenericFilePath, ListenerOptions};
+use interprocess::local_socket::{
+    prelude::*, ConnectOptions, GenericFilePath, ListenerNonblockingMode, ListenerOptions,
+};
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -20,7 +22,19 @@ pub fn create_fifo(path: &Path) -> Result<IpcListener> {
 
 impl IpcListener {
     pub fn accept(&self) -> Result<IpcStream> {
-        Ok(interprocess::local_socket::traits::Listener::accept(&self.listener)?)
+        Ok(interprocess::local_socket::traits::Listener::accept(
+            &self.listener,
+        )?)
+    }
+
+    pub fn set_nonblocking_accept(&self, nonblocking: bool) -> Result<()> {
+        let mode = if nonblocking {
+            ListenerNonblockingMode::Accept
+        } else {
+            ListenerNonblockingMode::Neither
+        };
+        interprocess::local_socket::traits::Listener::set_nonblocking(&self.listener, mode)?;
+        Ok(())
     }
 }
 
@@ -47,7 +61,11 @@ pub fn open_fifo_read_write(path: &Path) -> Result<IpcStream> {
 
 pub fn remove_fifo(_path: &Path) {}
 
-pub fn send_frame_file(mut file: impl Write, kind: FrameKind, payload: &[u8]) -> std::io::Result<()> {
+pub fn send_frame_file(
+    mut file: impl Write,
+    kind: FrameKind,
+    payload: &[u8],
+) -> std::io::Result<()> {
     let kind_byte = match kind {
         FrameKind::Exec => b'E',
         FrameKind::Stop => b'S',
@@ -87,7 +105,11 @@ pub fn read_frame_file(file: &mut impl Read, max_payload: usize) -> Result<Optio
         b'C' => FrameKind::Complete,
         b'T' => FrameKind::Stopped,
         b'X' => FrameKind::Err,
-        _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid frame kind").into()),
+        _ => {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid frame kind").into(),
+            )
+        }
     };
     Ok(Some(Frame { kind, payload }))
 }

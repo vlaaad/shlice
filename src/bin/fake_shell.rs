@@ -8,8 +8,14 @@ const COMMAND_BEGIN_MARKER: &str = "\x1b]133;C\x07";
 const COMMAND_DONE_PREFIX: &str = "\x1b]133;D;";
 
 fn main() {
-    let _ = write!(io::stdout(), "{READY_MARKER}fake> {PROMPT_END_MARKER}");
-    let _ = io::stdout().flush();
+    if let Ok(delay_ms) = std::env::var("FAKE_SHELL_STARTUP_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(())
+    {
+        thread::sleep(Duration::from_millis(delay_ms));
+    }
+    write_ready_marker();
     let stdin = io::stdin();
     let mut current = String::new();
     for line in stdin.lock().lines() {
@@ -39,16 +45,38 @@ fn main() {
                     let _ = write!(io::stdout(), "{text}");
                     let _ = io::stdout().flush();
                 }
-                let _ = write!(io::stdout(), "{COMMAND_DONE_PREFIX}{code}\x07{READY_MARKER}fake> {PROMPT_END_MARKER}");
+                let _ = write!(
+                    io::stdout(),
+                    "{COMMAND_DONE_PREFIX}{code}\x07{READY_MARKER}fake> {PROMPT_END_MARKER}"
+                );
                 let _ = io::stdout().flush();
             }
             Err(text) => {
                 let _ = writeln!(io::stderr(), "error: {text}");
-                let _ = write!(io::stdout(), "{COMMAND_DONE_PREFIX}1\x07{READY_MARKER}fake> {PROMPT_END_MARKER}");
+                let _ = write!(
+                    io::stdout(),
+                    "{COMMAND_DONE_PREFIX}1\x07{READY_MARKER}fake> {PROMPT_END_MARKER}"
+                );
                 let _ = io::stdout().flush();
             }
         }
     }
+}
+
+fn write_ready_marker() {
+    let mut stdout = io::stdout();
+    if std::env::var_os("FAKE_SHELL_FRAGMENT_READY").is_some() {
+        let split = READY_MARKER.len() / 2;
+        let _ = stdout.write_all(&READY_MARKER.as_bytes()[..split]);
+        let _ = stdout.flush();
+        thread::sleep(Duration::from_millis(10));
+        let _ = stdout.write_all(&READY_MARKER.as_bytes()[split..]);
+        let _ = write!(stdout, "fake> {PROMPT_END_MARKER}");
+        let _ = stdout.flush();
+        return;
+    }
+    let _ = write!(stdout, "{READY_MARKER}fake> {PROMPT_END_MARKER}");
+    let _ = stdout.flush();
 }
 
 fn balanced(value: &str) -> bool {
@@ -88,7 +116,12 @@ fn eval(command: &str) -> Result<(Option<String>, Option<String>, i32, u64), Str
         return Ok((Some("42\n".to_string()), None, 0, 0));
     }
     if trimmed.contains("println \"warn\"") {
-        return Ok((Some(":done\n".to_string()), Some("warn\n".to_string()), 0, 0));
+        return Ok((
+            Some(":done\n".to_string()),
+            Some("warn\n".to_string()),
+            0,
+            extract_sleep_ms(trimmed).unwrap_or(0),
+        ));
     }
     if trimmed.contains("Thread/sleep 6000") {
         return Ok((Some("one\n:first\n".to_string()), None, 0, 6000));
@@ -124,4 +157,11 @@ fn eval(command: &str) -> Result<(Option<String>, Option<String>, i32, u64), Str
         return Ok((Some(format!("{tag}\n:{tag}\n")), None, 0, 200));
     }
     Err(format!("unsupported command: {trimmed}"))
+}
+
+fn extract_sleep_ms(command: &str) -> Option<u64> {
+    let (_, rest) = command.split_once("Thread/sleep ")?;
+    rest.split(|ch: char| !ch.is_ascii_digit())
+        .find(|part| !part.is_empty())
+        .and_then(|part| part.parse::<u64>().ok())
 }

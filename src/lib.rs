@@ -27,9 +27,9 @@ pub enum AppError {
 pub type Result<T> = std::result::Result<T, AppError>;
 
 pub(crate) use broker::run_broker;
+pub(crate) use cli::BrokerOptions;
 pub(crate) use cli::{parse, Command, ExecOptions, StartOptions, StopOptions};
 pub(crate) use ipc::*;
-pub(crate) use cli::BrokerOptions;
 pub(crate) use output::*;
 pub(crate) use process::*;
 pub(crate) use protocol::*;

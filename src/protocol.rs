@@ -1,5 +1,4 @@
 use crate::{AppError, Result};
-use serde::{Deserialize, Serialize};
 use std::io::Write;
 
 pub const READY_MARKER: &str = "\x1b]133;A\x07";
@@ -43,19 +42,6 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WindowsRequest {
-    pub id: String,
-    pub command: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WindowsCompletion {
-    pub id: String,
-    pub exit_code: i32,
-    pub timed_out: bool,
-}
-
 pub fn build_exec_command(command: &str) -> String {
     if command.ends_with('\n') {
         command.to_string()
@@ -64,24 +50,6 @@ pub fn build_exec_command(command: &str) -> String {
         value.push('\n');
         value
     }
-}
-
-pub fn stringify_request(request: &WindowsRequest) -> Result<Vec<u8>> {
-    Ok(serde_json::to_vec_pretty(request)?)
-}
-
-#[cfg(windows)]
-pub fn parse_request(bytes: &[u8]) -> Result<WindowsRequest> {
-    Ok(serde_json::from_slice(bytes)?)
-}
-
-#[cfg(windows)]
-pub fn stringify_completion(completion: &WindowsCompletion) -> Result<Vec<u8>> {
-    Ok(serde_json::to_vec_pretty(completion)?)
-}
-
-pub fn parse_completion(bytes: &[u8]) -> Result<WindowsCompletion> {
-    Ok(serde_json::from_slice(bytes)?)
 }
 
 pub fn encode_exec_request(request: &ExecRequest) -> Vec<u8> {
@@ -102,19 +70,29 @@ pub fn parse_exec_request(bytes: &[u8]) -> Result<ExecRequest> {
     let mut reply_port = None;
     let mut timeout_ms = None;
     let mut command = None;
-    let text = std::str::from_utf8(bytes).map_err(|_| AppError::Msg("invalid request".to_string()))?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| AppError::Msg("invalid request".to_string()))?;
     for line in text.lines() {
-        let (key, value) = line.split_once('=').ok_or_else(|| AppError::Msg("invalid request".to_string()))?;
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| AppError::Msg("invalid request".to_string()))?;
         match key {
             "reply_path" => {
                 reply_port = Some(value.to_string());
             }
             "timeout_ms" => {
-                timeout_ms = Some(value.parse::<u64>().map_err(|_| AppError::Msg("invalid request".to_string()))?)
+                timeout_ms = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| AppError::Msg("invalid request".to_string()))?,
+                )
             }
             "command" => {
                 let bytes = hex_decode(value)?;
-                command = Some(String::from_utf8(bytes).map_err(|_| AppError::Msg("invalid request".to_string()))?)
+                command = Some(
+                    String::from_utf8(bytes)
+                        .map_err(|_| AppError::Msg("invalid request".to_string()))?,
+                )
             }
             _ => {}
         }
@@ -128,9 +106,12 @@ pub fn parse_exec_request(bytes: &[u8]) -> Result<ExecRequest> {
 
 pub fn parse_stop_request(bytes: &[u8]) -> Result<StopRequest> {
     let mut reply_path = None;
-    let text = std::str::from_utf8(bytes).map_err(|_| AppError::Msg("invalid request".to_string()))?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| AppError::Msg("invalid request".to_string()))?;
     for line in text.lines() {
-        let (key, value) = line.split_once('=').ok_or_else(|| AppError::Msg("invalid request".to_string()))?;
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| AppError::Msg("invalid request".to_string()))?;
         if key == "reply_path" {
             reply_path = Some(value.to_string());
         }
@@ -160,7 +141,9 @@ pub fn decode_completion(payload: &[u8]) -> Result<Completion> {
 }
 
 pub fn chunk_contains_ready(chunk: &[u8]) -> bool {
-    chunk.windows(READY_MARKER.len()).any(|window| window == READY_MARKER.as_bytes())
+    chunk
+        .windows(READY_MARKER.len())
+        .any(|window| window == READY_MARKER.as_bytes())
 }
 
 #[derive(Debug, Clone)]

@@ -79,9 +79,11 @@ fn parse_os(argv: Vec<OsString>) -> Result<Cli> {
         .map_err(|err| AppError::Msg(err.to_string()))?
     {
         Some(value) => value,
-        None => return Ok(Cli {
-            command: Command::Help,
-        }),
+        None => {
+            return Ok(Cli {
+                command: Command::Help,
+            })
+        }
     };
 
     let command = match subcommand.as_str() {
@@ -138,9 +140,12 @@ fn parse_stop(mut args: Arguments) -> Result<StopOptions> {
 }
 
 fn parse_broker(mut args: Arguments, command: Vec<String>) -> Result<BrokerOptions> {
-    let root = opt_string(&mut args, "--root")?.ok_or_else(|| AppError::Msg("invalid arguments".to_string()))?;
-    let id = opt_shell_id(&mut args, "--id")?.ok_or_else(|| AppError::Msg("invalid arguments".to_string()))?;
-    let cwd = opt_string(&mut args, "--cwd")?.ok_or_else(|| AppError::Msg("invalid arguments".to_string()))?;
+    let root = opt_string(&mut args, "--root")?
+        .ok_or_else(|| AppError::Msg("invalid arguments".to_string()))?;
+    let id = opt_shell_id(&mut args, "--id")?
+        .ok_or_else(|| AppError::Msg("invalid arguments".to_string()))?;
+    let cwd = opt_string(&mut args, "--cwd")?
+        .ok_or_else(|| AppError::Msg("invalid arguments".to_string()))?;
     ensure_empty(args)?;
     if command.is_empty() {
         return Err(AppError::Msg("invalid arguments".to_string()));
@@ -211,5 +216,8 @@ fn has_help(args: &mut Arguments) -> bool {
 }
 
 fn is_help(value: &OsString) -> bool {
-    matches!(value.to_string_lossy().as_ref(), "-h" | "--help" | "-?" | "help")
+    matches!(
+        value.to_string_lossy().as_ref(),
+        "-h" | "--help" | "-?" | "help"
+    )
 }
