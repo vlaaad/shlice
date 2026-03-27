@@ -91,10 +91,17 @@ pub fn run_broker(options: BrokerOptions) -> Result<u8> {
     spawn_stdout_loop(shared.clone(), stdout);
     spawn_stderr_loop(shared.clone(), stderr);
 
-    wait_for_ready(&shared, &root, &options.id, &mut record, &ready_path)?;
-    main_loop(shared, &root, &options.id, &mut child, stdin)?;
-    remove_shell(&root, &options.id)?;
-    Ok(0)
+    let result = (|| -> Result<u8> {
+        wait_for_ready(&shared, &root, &options.id, &mut record, &ready_path)?;
+        main_loop(shared, &root, &options.id, &mut child, stdin)?;
+        Ok(0)
+    })();
+
+    crate::ipc::remove_fifo(&control_path);
+    if result.is_err() {
+        let _ = remove_shell(&root, &options.id);
+    }
+    result
 }
 
 fn spawn_shell(options: &BrokerOptions) -> Result<Child> {
