@@ -673,12 +673,9 @@ fn state_stays_in_shlice() {
     assert!(stop.success());
 }
 
+#[cfg(not(windows))]
 #[test]
 fn unix_socket_paths_are_removed_after_stop() {
-    if cfg!(windows) {
-        return;
-    }
-
     let workspace = workspace();
     let shlice = exe("shlice");
     let fake_shell = exe("fake_shell");
